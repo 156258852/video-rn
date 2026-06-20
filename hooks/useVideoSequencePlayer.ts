@@ -10,7 +10,7 @@ type ClipForTime = {
 
 export type VideoSlotProps = {
   ref: React.RefObject<any>;
-  source?: {uri: string};
+  source?: {uri: string; bufferConfig?: {cacheSizeMB?: number}};
   paused: boolean;
   onLoad?: (e: any) => void;
   onProgress?: (e: any) => void;
@@ -478,7 +478,9 @@ export function useVideoSequencePlayer({
       }
 
       const uri = urls[videoIndex];
-      const source = uri ? {uri} : undefined;
+      const source = uri
+        ? {uri, bufferConfig: {cacheSizeMB: 200}}
+        : undefined;
 
       return {
         ref: playerRefs[i],

@@ -11,6 +11,7 @@ import {
   ScrollView,
   Modal,
   Animated,
+  ActivityIndicator,
 } from 'react-native';
 import Video from 'react-native-video';
 import {useAutoHideControls} from './hooks/useAutoHideControls';
@@ -30,6 +31,8 @@ function fmtTime(sec: number): string {
 export default function App(): React.JSX.Element {
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [muted, setMuted] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+  const [videoError, setVideoError] = useState<string | null>(null);
   const log = useCallback((msg: string) => {
     const ts = new Date().toISOString().slice(11, 19);
     // eslint-disable-next-line no-console
@@ -38,18 +41,15 @@ export default function App(): React.JSX.Element {
 
   // Stitched clips (URL only). Durations are read from <Video onLoad> for accuracy.
   const CLIPS = useMemo(
-    () => [
+    () => [ 
       {
-        uri: 'https://wwwuat2.aia.com.hk/content/dam/hk-aiaplus/aia-plus/videos/testvideo/v1.mp4',
+        uri: "https://bdcloud-player-new.cdn.bcebos.com/testvideo/mp4/360video/ThaiKongfu.mp4",
       },
       {
-        uri: 'https://wwwuat2.aia.com.hk/content/dam/hk-aiaplus/aia-plus/videos/testvideo/v2.mp4',
+        uri: 'https://media.w3.org/2010/05/sintel/trailer.mp4',
       },
       {
-        uri: 'https://wwwuat2.aia.com.hk/content/dam/hk-aiaplus/aia-plus/videos/testvideo/v3.mp4',
-      },
-      {
-        uri: 'https://www.aia.com.hk/content/dam/hk-wise/video/products/useful-tools-and-information/202507-aia-finance-news-mpf.mp4',
+        uri: 'https://sf1-cdn-tos.huoshanstatic.com/obj/media-fe/xgplayer_doc_video/mp4/xgplayer-demo-360p.mp4',
       },
     ],
     [],
@@ -117,6 +117,12 @@ export default function App(): React.JSX.Element {
   const onVideoBuffer = useCallback(
     (e: any) => {
       log(`buffer isBuffering=${String(!!e?.isBuffering)}`);
+      if (e?.isBuffering) {
+        setIsLoading(true);
+      } else {
+        setIsLoading(false);
+        setVideoError(null);
+      }
     },
     [log],
   );
@@ -124,6 +130,8 @@ export default function App(): React.JSX.Element {
   const onVideoError = useCallback(
     (e: any) => {
       log(`VIDEO_ERROR ${JSON.stringify(e)}`);
+      setIsLoading(false);
+      setVideoError(e?.error?.errorString ?? 'Playback error');
     },
     [log],
   );
@@ -148,6 +156,8 @@ export default function App(): React.JSX.Element {
         )} clip=${clipIdx} localT=${localT.toFixed(2)}`,
       );
       setIsFullscreen(next);
+      setIsLoading(next);
+      setVideoError(null);
     },
     [currentTimeRef, log, mp4Index, queueResumeForCurrentClip],
   );
@@ -453,6 +463,30 @@ export default function App(): React.JSX.Element {
             style={[styles.fsBottomOverlay, {opacity: fsOpacity}]}>
             {renderFsBottomBar()}
           </Animated.View>
+
+          {/* Loading overlay */}
+          {isLoading && !videoError && (
+            <View style={styles.overlayCenter} pointerEvents="none">
+              <ActivityIndicator size="large" color="#ffffff" />
+            </View>
+          )}
+
+          {/* Error overlay */}
+          {videoError && (
+            <View style={styles.overlayCenter}>
+              <Text style={styles.errorText}>{videoError}</Text>
+              <TouchableOpacity
+                style={styles.retryButton}
+                onPress={() => {
+                  setVideoError(null);
+                  setIsLoading(true);
+                  seekVirtual(virtualTime);
+                  setPlayingLogged(true, 'retry');
+                }}>
+                <Text style={styles.retryButtonText}>Retry</Text>
+              </TouchableOpacity>
+            </View>
+          )}
         </View>
       </Modal>
     </>
@@ -743,6 +777,32 @@ const styles = StyleSheet.create({
     left: 0,
     right: 0,
     bottom: 0,
+  },
+  overlayCenter: {
+    ...StyleSheet.absoluteFillObject,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: 'rgba(0,0,0,0.4)',
+    zIndex: 10,
+  },
+  errorText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
+    textAlign: 'center',
+    paddingHorizontal: 32,
+    marginBottom: 20,
+  },
+  retryButton: {
+    paddingHorizontal: 28,
+    paddingVertical: 10,
+    borderRadius: 20,
+    backgroundColor: '#ffffff',
+  },
+  retryButtonText: {
+    color: '#000',
+    fontSize: 14,
+    fontWeight: '700',
   },
   fsBottomBar: {
     paddingHorizontal: 20,

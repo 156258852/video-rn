@@ -64,7 +64,7 @@ export function useVideoDurations(urls: string[]): UseVideoDurationsResult {
     <Video
       // force remount per URL to avoid stale onLoad behaviour
       key={`dur-preload-${preloadIndex}-${urls[preloadIndex]}`}
-      source={{uri: urls[preloadIndex]}}
+      source={{uri: urls[preloadIndex], bufferConfig: {cacheSizeMB: 200}}}
       paused={true}
       muted={true}
       controls={false}
