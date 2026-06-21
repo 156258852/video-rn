@@ -249,9 +249,26 @@ export function useVideoSequencePlayer({
           lastProgressRef.current = {idx: clipIdx, time};
           seekOnActivePlayer(time);
         }
+        return;
+      }
+
+      // Pre-render first frame for preloaded (inactive) player.
+      // seek(0) forces the decoder to decode and render frame 0, so when this
+      // slot later becomes active, play() produces a visible frame almost
+      // instantly — eliminating the ~100-300ms first-frame decode delay.
+      if (playerIdx !== activePlayerRef.current) {
+        playerRefs[playerIdx]?.current?.seek?.(0);
       }
     },
-    [applyLocalTime, currentIndexRef, recordDuration, seekOnActivePlayer, urls],
+    [
+      activePlayerRef,
+      applyLocalTime,
+      currentIndexRef,
+      playerRefs,
+      recordDuration,
+      seekOnActivePlayer,
+      urls,
+    ],
   );
 
   const onClipProgress = useCallback(
@@ -478,9 +495,7 @@ export function useVideoSequencePlayer({
       }
 
       const uri = urls[videoIndex];
-      const source = uri
-        ? {uri, bufferConfig: {cacheSizeMB: 200}}
-        : undefined;
+      const source = uri ? {uri, bufferConfig: {cacheSizeMB: 200}} : undefined;
 
       return {
         ref: playerRefs[i],
