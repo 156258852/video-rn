@@ -1,6 +1,8 @@
 import React, {useCallback, useEffect, useState, useMemo} from 'react';
 import Video from 'react-native-video';
 
+type OnLoadData = {duration: number};
+
 type UseVideoDurationsResult = {
   durations: number[];
   recordDuration: (idx: number, durationSeconds: number) => void;
@@ -70,7 +72,7 @@ export function useVideoDurations(urls: string[]): UseVideoDurationsResult {
       controls={false}
       playInBackground={false}
       playWhenInactive={false}
-      onLoad={(e: any) => recordDuration(preloadIndex, e?.duration)}
+      onLoad={(e: OnLoadData) => recordDuration(preloadIndex, e.duration)}
       style={preloadVideoStyle}
     />
   ) : null;
