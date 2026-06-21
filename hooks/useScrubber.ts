@@ -38,6 +38,7 @@ export function useScrubber({
 
   const scrubStartXRef = useRef(0);
   const scrubCurrentXRef = useRef(0);
+  const trackPageXRef = useRef(0);
   const clearPreviewTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
   );
@@ -89,7 +90,14 @@ export function useScrubber({
   }, [displayedX]);
 
   const onTrackLayout = useCallback((e: any) => {
-    setTrackW(Number(e?.nativeEvent?.layout?.width ?? 0));
+    const w = Number(e?.nativeEvent?.layout?.width ?? 0);
+    setTrackW(w);
+    // Measure absolute screen position for locationX fallback in PanResponder
+    trackRef.current?.measureInWindow?.((x: number) => {
+      if (Number.isFinite(x)) {
+        trackPageXRef.current = x;
+      }
+    });
   }, []);
 
   // PanResponder is created ONCE and never recreated. All callbacks read from
@@ -109,8 +117,14 @@ export function useScrubber({
         onSeekingChangeRef.current?.(true);
 
         const ne = evt?.nativeEvent;
-        const x = Number.isFinite(Number(ne?.locationX))
-          ? Number(ne.locationX)
+        const locX = Number(ne?.locationX);
+        const pgX = Number(ne?.pageX);
+        // locationX can be unreliable on some Android devices; fall back to
+        // pageX - trackPageX (measured in onTrackLayout via measureInWindow)
+        const x = Number.isFinite(locX)
+          ? locX
+          : Number.isFinite(pgX) && trackPageXRef.current > 0
+          ? pgX - trackPageXRef.current
           : 0;
         scrubStartXRef.current = x;
         scrubCurrentXRef.current = x;
@@ -128,8 +142,12 @@ export function useScrubber({
       },
       onPanResponderMove: (evt, gesture) => {
         const ne = evt?.nativeEvent;
-        const locationX = Number.isFinite(Number(ne?.locationX))
-          ? Number(ne.locationX)
+        const locX = Number(ne?.locationX);
+        const pgX = Number(ne?.pageX);
+        const locationX = Number.isFinite(locX)
+          ? locX
+          : Number.isFinite(pgX) && trackPageXRef.current > 0
+          ? pgX - trackPageXRef.current
           : 0;
         const x = Number.isFinite(gesture?.dx)
           ? scrubStartXRef.current + gesture.dx
@@ -175,6 +193,9 @@ export function useScrubber({
           setPreviewX(null);
           clearPreviewTimeoutRef.current = null;
         }, delay);
+
+        scrubStartXRef.current = 0;
+        scrubCurrentXRef.current = 0;
       },
       onPanResponderTerminate: () => {
         setPreviewTime(null);
