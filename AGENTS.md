@@ -86,3 +86,5 @@ Fullscreen is implemented as a `<Modal>` that **remounts** the `<Video>` compone
 - **iOS** is the primary target. The app uses `react-native-video` v6 which maps to AVPlayer on iOS and ExoPlayer on Android.
 - `bufferConfig.cacheSizeMB: 200` is set on video sources for disk caching (ExoPlayer on Android; iOS uses NSURLCache defaults).
 - Xcode build environment: Node path is configured in `ios/.xcode.env.local` (nvm sourcing).
+
+## use Chinese output

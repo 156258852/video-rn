@@ -23,7 +23,7 @@ export function useAutoHideControls({
   delayMs = 3500,
 }: UseAutoHideControlsParams): UseAutoHideControlsResult {
   const [visible, setVisible] = useState(true);
-  const visibleRef = useRef(true);
+  const visibleRef = useLatestRef(visible);
 
   const opacity = useRef(new Animated.Value(1)).current;
 
@@ -37,25 +37,22 @@ export function useAutoHideControls({
     }
   }, []);
 
-  const animate = useCallback(
-    (toVisible: boolean) => {
-      visibleRef.current = toVisible;
-      setVisible(toVisible);
+  const animate = useCallback((toVisible: boolean) => {
+    setVisible(toVisible);
 
-      Animated.timing(opacity, {
-        toValue: toVisible ? 1 : 0,
-        duration: 200,
-        useNativeDriver: true,
-      }).start();
-    },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [],
-  );
+    opacity.stopAnimation();
+    Animated.timing(opacity, {
+      toValue: toVisible ? 1 : 0,
+      duration: 200,
+      useNativeDriver: true,
+    }).start();
+  }, []);
 
   const scheduleHide = useCallback(() => {
     cancelHideTimer();
 
     // Don't auto-hide while paused — user is probably reading the UI.
+    // playingRef is a stable ref from useLatestRef — safe to read inside callbacks.
     if (!playingRef.current) {
       return;
     }
@@ -63,7 +60,8 @@ export function useAutoHideControls({
     hideTimerRef.current = setTimeout(() => {
       animate(false);
     }, delayMs);
-  }, [animate, cancelHideTimer, delayMs, playingRef]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- playingRef is a stable useLatestRef
+  }, [animate, cancelHideTimer, delayMs]);
 
   const show = useCallback(() => {
     animate(true);
@@ -82,10 +80,6 @@ export function useAutoHideControls({
       show();
     }
   }, [hide, show]);
-
-  const onTap = useCallback(() => {
-    toggle();
-  }, [toggle]);
 
   // Reset visibility whenever we (re)enter fullscreen, and clear timer on exit.
   useEffect(() => {
@@ -115,5 +109,5 @@ export function useAutoHideControls({
     }
   }, [playing, enabled, scheduleHide, cancelHideTimer, animate]);
 
-  return {visible, opacity, show, hide, toggle, onTap};
+  return {visible, opacity, show, hide, toggle, onTap: toggle};
 }
