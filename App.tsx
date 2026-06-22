@@ -11,6 +11,7 @@ import {
   ScrollView,
   Modal,
   Animated,
+  ActivityIndicator,
 } from 'react-native';
 import Video from 'react-native-video';
 import {useAutoHideControls} from './hooks/useAutoHideControls';
@@ -63,6 +64,9 @@ export default function App(): React.JSX.Element {
     setPlaying,
     playingRef,
     hasCompletedPlayback,
+
+    isLoading,
+    isBuffering,
 
     currentIndex: mp4Index,
     currentTimeRef,
@@ -118,6 +122,8 @@ export default function App(): React.JSX.Element {
     [log],
   );
 
+  const showOverlay = !timelineReady || isLoading || isBuffering;
+
   const onVideoError = useCallback(
     (e: any) => {
       log(`VIDEO_ERROR ${JSON.stringify(e)}`);
@@ -152,8 +158,9 @@ export default function App(): React.JSX.Element {
   // ---- Fullscreen auto-hide controls (iOS-native-player style) ----
   const fsControls = useAutoHideControls({
     enabled: isFullscreen,
-    playing,
-    delayMs: 3500,
+    // Treat scrubbing as "paused" so auto-hide timer never fires during drag.
+    playing: playing && !scrubber.isSeeking,
+    delayMs: 3000,
   });
 
   const fsControlsVisible = fsControls.visible;
@@ -177,7 +184,7 @@ export default function App(): React.JSX.Element {
               StyleSheet.absoluteFill,
               extraStyle,
               {
-                opacity: isActive ? 1 : 0,
+                opacity: isActive && !isLoading ? 1 : 0,
                 zIndex: isActive ? 2 : 1,
               },
             ]}
@@ -185,12 +192,24 @@ export default function App(): React.JSX.Element {
             onLoad={slot.onLoad}
             onProgress={slot.onProgress}
             onEnd={slot.onEnd}
-            onBuffer={onVideoBuffer}
+            onBuffer={slot.onBuffer ?? onVideoBuffer}
             onError={onVideoError}
             controls={false}
           />
         );
       })}
+
+      {/* Loading overlay: black bg + spinner, covers all video slots */}
+      {showOverlay && (
+        <View style={StyleSheet.absoluteFill}>
+          <View style={styles.loadingBackdrop} />
+          <ActivityIndicator
+            size="large"
+            color="#ffffff"
+            style={styles.loadingSpinner}
+          />
+        </View>
+      )}
     </View>
   );
 
@@ -437,10 +456,15 @@ export default function App(): React.JSX.Element {
             {renderFsTopBar()}
           </Animated.View>
 
-          {/* Center play controls overlay */}
+          {/* Center play controls overlay — hidden during loading */}
           <Animated.View
-            pointerEvents={fsControlsVisible ? 'box-none' : 'none'}
-            style={[styles.fsCenterOverlay, {opacity: fsOpacity}]}>
+            pointerEvents={
+              !showOverlay && fsControlsVisible ? 'box-none' : 'none'
+            }
+            style={[
+              styles.fsCenterOverlay,
+              {opacity: showOverlay ? 0 : fsOpacity},
+            ]}>
             {renderFsCenterControls()}
           </Animated.View>
 
@@ -815,5 +839,13 @@ const styles = StyleSheet.create({
     height: 16,
     borderRadius: 8,
     backgroundColor: '#ffffff',
+  },
+
+  loadingBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: '#000',
+  },
+  loadingSpinner: {
+    ...StyleSheet.absoluteFillObject,
   },
 });

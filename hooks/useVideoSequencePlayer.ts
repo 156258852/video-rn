@@ -15,6 +15,7 @@ export type VideoSlotProps = {
   onLoad?: (e: any) => void;
   onProgress?: (e: any) => void;
   onEnd?: () => void;
+  onBuffer?: (e: any) => void;
 };
 
 type UseVideoSequencePlayerParams = {
@@ -80,6 +81,13 @@ export function useVideoSequencePlayer({
 
   const [times, setTimes] = useState<number[]>([]);
 
+  // ---------------- loading / buffering state ----------------
+  const [isLoading, setIsLoading] = useState(true);
+  const [isBuffering, setIsBuffering] = useState(false);
+  const prevBufferingRef = useRef(false);
+  // Flag: next onProgress from active player should clear isLoading.
+  const needsProgressClearRef = useRef(true);
+
   const pendingSeekRef = useRef<SeekRequest | null>(null);
   const pendingResumeRef = useRef<SeekRequest | null>(null);
   const isSeekingInternalRef = useRef(false);
@@ -136,6 +144,11 @@ export function useVideoSequencePlayer({
     loadedSlotRef.current = {0: null, 1: null};
 
     setTimes(Array(urls.length).fill(0));
+
+    setIsLoading(true);
+    setIsBuffering(false);
+    prevBufferingRef.current = false;
+    needsProgressClearRef.current = true;
 
     bumpVersion();
   }, [urls, bumpVersion, clearTimer]);
@@ -280,6 +293,12 @@ export function useVideoSequencePlayer({
         return;
       }
 
+      // Clear loading overlay once actual frame rendering is confirmed.
+      if (needsProgressClearRef.current) {
+        needsProgressClearRef.current = false;
+        setIsLoading(false);
+      }
+
       const t = Number(e?.currentTime ?? 0);
 
       const prev = lastProgressRef.current;
@@ -328,6 +347,9 @@ export function useVideoSequencePlayer({
         // Queue a seek to t=0 on the new clip — onClipLoad will apply it once
         // the source is ready, avoiding the race condition of seeking before load.
         pendingSeekRef.current = {idx: nextIndex, time: 0};
+
+        setIsLoading(true);
+        needsProgressClearRef.current = true;
 
         setActivePlayer(nextPlayer);
         setCurrentIndex(nextIndex);
@@ -405,6 +427,10 @@ export function useVideoSequencePlayer({
       if (nextIdx !== currentIndexRef.current) {
         const nextPlayer = activePlayerRef.current === 0 ? 1 : 0;
         pendingSeekRef.current = {idx: nextIdx, time: t};
+
+        setIsLoading(true);
+        needsProgressClearRef.current = true;
+
         setActivePlayer(nextPlayer);
         setCurrentIndex(nextIdx);
         // If the inactive player already loaded this clip, seek immediately
@@ -440,6 +466,9 @@ export function useVideoSequencePlayer({
 
     const payload = {idx, time: localT};
     pendingResumeRef.current = payload;
+    // Show loading until onProgress confirms frame rendering after remount.
+    setIsLoading(true);
+    needsProgressClearRef.current = true;
 
     return payload;
   }, [currentIndex, times]);
@@ -473,6 +502,16 @@ export function useVideoSequencePlayer({
     return Math.min(currentIndex + 1, urls.length - 1);
   }, [currentIndex, urls.length]);
 
+  // ---------------- buffer events ----------------
+
+  const onClipBuffer = useCallback((clipIdx: number, e: any) => {
+    const buf = !!e?.isBuffering;
+    if (prevBufferingRef.current !== buf) {
+      prevBufferingRef.current = buf;
+      setIsBuffering(buf);
+    }
+  }, []);
+
   // ---------------- video slots ----------------
 
   const videoSlots: VideoSlotProps[] = useMemo(() => {
@@ -491,6 +530,7 @@ export function useVideoSequencePlayer({
           onLoad: undefined,
           onProgress: undefined,
           onEnd: undefined,
+          onBuffer: undefined,
         };
       }
 
@@ -507,12 +547,14 @@ export function useVideoSequencePlayer({
           ? (e: any) => onClipProgress(videoIndex, e)
           : undefined,
         onEnd: isActive ? () => onEnd(videoIndex) : undefined,
+        onBuffer: (e: any) => onClipBuffer(videoIndex, e),
       };
     });
   }, [
     activePlayer,
     currentIndex,
     inactiveTargetIndex,
+    onClipBuffer,
     onClipLoad,
     onClipProgress,
     onEnd,
@@ -529,6 +571,10 @@ export function useVideoSequencePlayer({
     setPlaying,
     playingRef,
     hasCompletedPlayback,
+
+    isLoading,
+    setIsLoading,
+    isBuffering,
 
     currentIndex,
     currentTimeRef,

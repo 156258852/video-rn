@@ -60,6 +60,9 @@ export function useVideoSequenceTimelinePlayer({
     setPlaying: player.setPlaying,
     playingRef: player.playingRef,
     hasCompletedPlayback: player.hasCompletedPlayback,
+    isLoading: player.isLoading,
+    setIsLoading: player.setIsLoading,
+    isBuffering: player.isBuffering,
     currentIndex: player.currentIndex,
     currentTimeRef: player.currentTimeRef,
 
