@@ -72,7 +72,14 @@ export function useVideoDurations(urls: string[]): UseVideoDurationsResult {
       controls={false}
       playInBackground={false}
       playWhenInactive={false}
-      onLoad={(e: OnLoadData) => recordDuration(preloadIndex, e.duration)}
+      onLoad={(e: OnLoadData) => {
+        console.log('useVideoDurations onLoad', {
+          preloadIndex,
+          uri: urls[preloadIndex],
+          duration: e.duration,
+        });
+        recordDuration(preloadIndex, e.duration);
+      }}
       style={preloadVideoStyle}
     />
   ) : null;
