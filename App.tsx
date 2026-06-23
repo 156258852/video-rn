@@ -43,9 +43,9 @@ export default function App(): React.JSX.Element {
       {
         uri: 'https://bdcloud-player-new.cdn.bcebos.com/testvideo/mp4/360video/ThaiKongfu.mp4',
       },
-      // {
-      //   uri: 'https://media.w3.org/2010/05/sintel/trailer.mp4',
-      // },
+      {
+        uri: 'https://media.w3.org/2010/05/sintel/trailer.mp4',
+      },
       {
         uri: 'https://sf1-cdn-tos.huoshanstatic.com/obj/media-fe/xgplayer_doc_video/mp4/xgplayer-demo-360p.mp4',
       },

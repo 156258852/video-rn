@@ -1,12 +1,16 @@
-import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
+import React, {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import {useLatestRef} from './useLatestRef';
 
+// ======================= 类型定义 =======================
 type SeekRequest = {idx: number; time: number};
-
-type ClipForTime = {
-  idx: number;
-  local: number;
-};
+type ClipForTime = {idx: number; local: number};
 
 export type VideoSlotProps = {
   ref: React.RefObject<any>;
@@ -16,9 +20,10 @@ export type VideoSlotProps = {
   onProgress?: (e: any) => void;
   onEnd?: () => void;
   onBuffer?: (e: any) => void;
+  onError?: (e: any) => void;
 };
 
-type UseVideoSequencePlayerParams = {
+type Params = {
   urls: string[];
   durations: number[];
   recordDuration?: (idx: number, durationSeconds: number) => void;
@@ -26,9 +31,12 @@ type UseVideoSequencePlayerParams = {
   getClipForTime?: (t: number) => ClipForTime;
 };
 
-type SeekToClipOptions = {
-  play?: boolean;
-};
+type SeekOptions = {play?: boolean};
+
+// ======================= 常量 =======================
+const BUFFER_CONFIG = {cacheSizeMB: 200};
+const COMPLETION_RATIO = 0.98;
+const MAX_PROGRESS_STEP = 1.5;
 
 export function useVideoSequencePlayer({
   urls,
@@ -36,17 +44,13 @@ export function useVideoSequencePlayer({
   recordDuration,
   isSeeking,
   getClipForTime,
-}: UseVideoSequencePlayerParams) {
-  const COMPLETION_WATCH_RATIO = 0.98;
-  const MAX_NATURAL_PROGRESS_STEP_SECONDS = 1.5;
-
-  // ---------------- refs ----------------
+}: Params) {
+  // ======================= 基础 Refs =======================
   const playerRef0 = useRef<any>(null);
   const playerRef1 = useRef<any>(null);
   const playerRefs = useMemo(() => [playerRef0, playerRef1] as const, []);
 
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
   const clearTimer = useCallback(() => {
     if (timerRef.current) {
       clearTimeout(timerRef.current);
@@ -55,116 +59,60 @@ export function useVideoSequencePlayer({
   }, []);
 
   useEffect(() => {
-    return () => clearTimer(); // ✅ 防内存泄漏
+    return () => clearTimer();
   }, [clearTimer]);
 
-  // ---------------- player state ----------------
+  // ======================= 核心状态 =======================
   const [activePlayer, setActivePlayer] = useState(0);
-  const activePlayerRef = useLatestRef(activePlayer);
-
-  const [playing, setPlaying] = useState(false);
-  const playingRef = useLatestRef(playing);
-
-  const [hasCompletedPlayback, setHasCompletedPlayback] = useState(false);
-
   const [currentIndex, setCurrentIndex] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [hasCompletedPlayback, setHasCompletedPlayback] = useState(false);
+  const [version, setVersion] = useState(0);
+  const [times, setTimes] = useState<number[]>([]);
+
+  const activePlayerRef = useLatestRef(activePlayer);
   const currentIndexRef = useLatestRef(currentIndex);
+  const playingRef = useLatestRef(playing);
+  const isSeekingRef = useLatestRef(isSeeking);
+  const timesRef = useLatestRef(times);
 
   const currentTimeRef = useRef(0);
 
-  // version is only bumped on meaningful state changes (seek / clip switch),
-  // NOT on every progress tick, to avoid unnecessary re-renders.
-  const [version, setVersion] = useState(0);
-  const bumpVersion = useCallback(() => {
-    setVersion(v => v + 1);
-  }, []);
-
-  const [times, setTimes] = useState<number[]>([]);
-
-  // ---------------- loading / buffering state ----------------
   const [isLoading, setIsLoading] = useState(true);
   const [isBuffering, setIsBuffering] = useState(false);
+  const [error, setError] = useState<any>(null);
   const prevBufferingRef = useRef(false);
-  // Flag: next onProgress from active player should clear isLoading.
   const needsProgressClearRef = useRef(true);
 
   const pendingSeekRef = useRef<SeekRequest | null>(null);
   const pendingResumeRef = useRef<SeekRequest | null>(null);
   const isSeekingInternalRef = useRef(false);
-  // Tracks which clip each player slot has loaded, keyed by player index.
-  // Used to detect when a pending seek target is already preloaded so we can
-  // seek immediately without waiting for another onLoad that will never come.
+
   const loadedSlotRef = useRef<
     Record<number, {clipIdx: number; uri: string} | null>
-  >({0: null, 1: null});
+  >({
+    0: null,
+    1: null,
+  });
+
   const watchedSecondsRef = useRef(0);
   const lastProgressRef = useRef<{idx: number; time: number} | null>(null);
 
-  const getKnownTotalDuration = useCallback(() => {
-    return durations.reduce((sum, d) => {
-      const dd = Number(d);
-      return Number.isFinite(dd) && dd > 0 ? sum + dd : sum;
-    }, 0);
-  }, [durations]);
-
-  const finalizeClipWatch = useCallback(
-    (clipIdx: number) => {
-      const d = Number(durations[clipIdx]);
-      const lp = lastProgressRef.current;
-
-      if (!Number.isFinite(d) || d <= 0 || !lp || lp.idx !== clipIdx) {
-        return;
-      }
-
-      // Only top-up short tail near the end; large gaps are likely seek jumps.
-      const tail = d - lp.time;
-      if (tail > 0 && tail <= MAX_NATURAL_PROGRESS_STEP_SECONDS) {
-        watchedSecondsRef.current += tail;
-      }
-
-      lastProgressRef.current = {idx: clipIdx, time: d};
-    },
-    [durations],
+  const [pendingSeekTarget, setPendingSeekTarget] = useState<number | null>(
+    null,
   );
 
-  // ---------------- reset ----------------
-  useEffect(() => {
-    clearTimer();
+  const [resumeVersion, setResumeVersion] = useState(0);
+  const [resumeCleanupVersion, setResumeCleanupVersion] = useState(0);
+  const resumeKeyRef = useRef(0);
 
-    setActivePlayer(0);
-    setCurrentIndex(0);
-    setPlaying(false);
-    setHasCompletedPlayback(false);
-    currentTimeRef.current = 0;
-    watchedSecondsRef.current = 0;
-    lastProgressRef.current = null;
+  // ======================= 辅助函数 =======================
+  const bumpVersion = useCallback(() => setVersion(v => v + 1), []);
 
-    pendingSeekRef.current = null;
-    pendingResumeRef.current = null;
-    loadedSlotRef.current = {0: null, 1: null};
-
-    setTimes(Array(urls.length).fill(0));
-
-    setIsLoading(true);
-    setIsBuffering(false);
-    prevBufferingRef.current = false;
-    needsProgressClearRef.current = true;
-
-    bumpVersion();
-  }, [urls, bumpVersion, clearTimer]);
-
-  // ---------------- helpers ----------------
   const applyLocalTime = useCallback(
     (clipIdx: number, t: number) => {
-      // Bounds check to prevent out-of-range writes
-      if (clipIdx < 0 || clipIdx >= urls.length) {
-        return;
-      }
-
+      if (clipIdx < 0 || clipIdx >= urls.length) return;
       currentTimeRef.current = t;
-
-      // Only update state (triggering re-render) — no bumpVersion here.
-      // bumpVersion is reserved for seek / clip-switch events.
       setTimes(prev => {
         const next =
           prev.length === urls.length ? [...prev] : Array(urls.length).fill(0);
@@ -175,23 +123,45 @@ export function useVideoSequencePlayer({
     [urls.length],
   );
 
-  const seekOnActivePlayer = useCallback(
+  const seekOnActive = useCallback(
     (t: number) => {
-      const player = playerRefs[activePlayerRef.current]?.current;
-      player?.seek?.(t);
+      playerRefs[activePlayerRef.current]?.current?.seek?.(t);
     },
     [activePlayerRef, playerRefs],
   );
 
-  // When seekToClip or onEnd targets a cross-clip switch, check immediately
-  // whether the target player already has that clip loaded from preload.
-  // If so, seek it without waiting for an onLoad that will never fire again.
-  const checkAndFlushPendingSeek = useCallback(
+  const getTotalDuration = useCallback(
+    () =>
+      durations.reduce((s, d) => (Number.isFinite(d) && d > 0 ? s + d : s), 0),
+    [durations],
+  );
+
+  const allDurationsKnown = useCallback(
+    () =>
+      durations.length === urls.length &&
+      durations.every(d => Number.isFinite(d) && d > 0),
+    [durations, urls.length],
+  );
+
+  const finalizeClip = useCallback(
+    (clipIdx: number) => {
+      const d = durations[clipIdx] ?? 0;
+      const lp = lastProgressRef.current;
+      if (!Number.isFinite(d) || d <= 0 || !lp || lp.idx !== clipIdx) return;
+      const tail = d - lp.time;
+      if (tail > 0 && tail <= MAX_PROGRESS_STEP)
+        watchedSecondsRef.current += tail;
+      lastProgressRef.current = {idx: clipIdx, time: d};
+    },
+    [durations],
+  );
+
+  const flushPendingSeek = useCallback(
     (targetPlayerIdx: number, targetClipIdx: number) => {
       const loaded = loadedSlotRef.current[targetPlayerIdx];
       if (
         loaded?.clipIdx === targetClipIdx &&
-        loaded.uri === (urls[targetClipIdx] ?? '')
+        loaded.uri === urls[targetClipIdx]
       ) {
         const time = pendingSeekRef.current?.time ?? 0;
         pendingSeekRef.current = null;
@@ -199,172 +169,124 @@ export function useVideoSequencePlayer({
         lastProgressRef.current = {idx: targetClipIdx, time};
         isSeekingInternalRef.current = true;
         playerRefs[targetPlayerIdx]?.current?.seek?.(time);
-        if (typeof queueMicrotask === 'function') {
-          queueMicrotask(() => {
-            isSeekingInternalRef.current = false;
-          });
-        } else {
-          Promise.resolve().then(() => {
-            isSeekingInternalRef.current = false;
-          });
-        }
+        const clear = () => {
+          isSeekingInternalRef.current = false;
+        };
+        typeof queueMicrotask === 'function'
+          ? queueMicrotask(clear)
+          : Promise.resolve().then(clear);
+        setPendingSeekTarget(null);
       }
     },
     [applyLocalTime, playerRefs, urls],
   );
 
-  // ---------------- events ----------------
-
-  const onClipLoad = useCallback(
+  // ======================= 回调实现 =======================
+  const onLoad = useCallback(
     (playerIdx: number, clipIdx: number, e: any) => {
-      // Record that this player slot has finished loading this clip.
       loadedSlotRef.current[playerIdx] = {clipIdx, uri: urls[clipIdx] ?? ''};
 
       const d = Number(e?.duration);
-      if (recordDuration && Number.isFinite(d)) {
-        recordDuration(clipIdx, d);
-      }
+      if (recordDuration && Number.isFinite(d)) recordDuration(clipIdx, d);
 
-      // Pending seek — source just loaded for a cross-clip seek or auto-advance.
-      // Seek immediately now that the player is ready (no setTimeout needed).
+      if (playerIdx === activePlayerRef.current) setError(null);
+
       if (pendingSeekRef.current?.idx === clipIdx) {
-        if (clipIdx === currentIndexRef.current) {
-          const time = pendingSeekRef.current.time;
-          pendingSeekRef.current = null;
-          applyLocalTime(clipIdx, time);
-          lastProgressRef.current = {idx: clipIdx, time};
-          // Block onClipProgress from updating times while we seek.
-          // Use a flag rather than state to avoid setState overhead.
-          // The flag is cleared synchronously after seek to minimize lag.
-          isSeekingInternalRef.current = true;
-          seekOnActivePlayer(time);
-          // Clear immediately in next microtask to unblock onClipProgress quickly.
-          // queueMicrotask may be unavailable in some RN/Jest runtimes.
-          if (typeof queueMicrotask === 'function') {
-            queueMicrotask(() => {
-              isSeekingInternalRef.current = false;
-            });
-          } else {
-            Promise.resolve().then(() => {
-              isSeekingInternalRef.current = false;
-            });
-          }
-        }
+        const time = pendingSeekRef.current.time;
+        pendingSeekRef.current = null;
+        applyLocalTime(clipIdx, time);
+        lastProgressRef.current = {idx: clipIdx, time};
+        isSeekingInternalRef.current = true;
+        playerRefs[playerIdx]?.current?.seek?.(time);
+        const clear = () => {
+          isSeekingInternalRef.current = false;
+        };
+        typeof queueMicrotask === 'function'
+          ? queueMicrotask(clear)
+          : Promise.resolve().then(clear);
+        setPendingSeekTarget(null);
         return;
       }
 
-      // Pending resume (after fullscreen toggle / remount).
       if (pendingResumeRef.current?.idx === clipIdx) {
-        if (clipIdx === currentIndexRef.current) {
-          const time = pendingResumeRef.current.time;
-          pendingResumeRef.current = null;
-          applyLocalTime(clipIdx, time);
-          lastProgressRef.current = {idx: clipIdx, time};
-          seekOnActivePlayer(time);
-        }
+        const time = pendingResumeRef.current.time;
+        pendingResumeRef.current = null;
+        applyLocalTime(clipIdx, time);
+        lastProgressRef.current = {idx: clipIdx, time};
+        playerRefs[playerIdx]?.current?.seek?.(time);
+        setResumeCleanupVersion(v => v + 1);
         return;
       }
 
-      // Pre-render first frame for preloaded (inactive) player.
-      // seek(0) forces the decoder to decode and render frame 0, so when this
-      // slot later becomes active, play() produces a visible frame almost
-      // instantly — eliminating the ~100-300ms first-frame decode delay.
       if (playerIdx !== activePlayerRef.current) {
         playerRefs[playerIdx]?.current?.seek?.(0);
       }
     },
-    [
-      activePlayerRef,
-      applyLocalTime,
-      currentIndexRef,
-      playerRefs,
-      recordDuration,
-      seekOnActivePlayer,
-      urls,
-    ],
+    [activePlayerRef, applyLocalTime, playerRefs, recordDuration, urls],
   );
 
-  const onClipProgress = useCallback(
+  const onProgress = useCallback(
     (clipIdx: number, e: any) => {
-      if (isSeeking || isSeekingInternalRef.current) {
-        return;
-      }
-      if (clipIdx !== currentIndexRef.current) {
-        return;
-      }
+      if (isSeekingRef.current || isSeekingInternalRef.current) return;
+      if (clipIdx !== currentIndexRef.current) return;
 
-      // Clear loading overlay once actual frame rendering is confirmed.
       if (needsProgressClearRef.current) {
         needsProgressClearRef.current = false;
         setIsLoading(false);
       }
 
       const t = Number(e?.currentTime ?? 0);
-
       const prev = lastProgressRef.current;
       if (prev && prev.idx === clipIdx) {
         const delta = t - prev.time;
-        if (delta > 0 && delta <= MAX_NATURAL_PROGRESS_STEP_SECONDS) {
+        if (delta > 0 && delta <= MAX_PROGRESS_STEP)
           watchedSecondsRef.current += delta;
-        }
       }
-
       lastProgressRef.current = {idx: clipIdx, time: t};
       applyLocalTime(clipIdx, t);
     },
-    [applyLocalTime, currentIndexRef, isSeeking],
+    [applyLocalTime, currentIndexRef, isSeekingRef],
   );
 
   const onEnd = useCallback(
-    (clipIdx: number) => {
-      // Guard against stale onEnd callbacks from a clip that is no longer active.
-      if (clipIdx !== currentIndexRef.current) {
+    (clipIdx: number, playerIdx: number) => {
+      if (playerIdx !== activePlayerRef.current) return;
+      if (pendingSeekRef.current && pendingSeekRef.current.idx !== clipIdx)
         return;
-      }
-      const idx = clipIdx;
+      if (clipIdx !== currentIndexRef.current) return;
 
-      if (idx < urls.length - 1) {
-        const nextIndex = idx + 1;
+      if (clipIdx < urls.length - 1) {
+        const nextIdx = clipIdx + 1;
         const nextPlayer = activePlayerRef.current === 0 ? 1 : 0;
 
         clearTimer();
-        finalizeClipWatch(idx);
+        finalizeClip(clipIdx);
 
-        // Pin current clip's time to its full duration so the UI shows 100%.
         setTimes(prev => {
           const next =
             prev.length === urls.length
               ? [...prev]
               : Array(urls.length).fill(0);
-          const dur = durations[idx];
-          next[idx] = Number.isFinite(dur) ? dur : next[idx] ?? 0;
-          next[nextIndex] = 0;
+          next[clipIdx] = durations[clipIdx] ?? prev[clipIdx] ?? 0;
+          next[nextIdx] = 0;
           return next;
         });
 
         currentTimeRef.current = 0;
-
-        // Queue a seek to t=0 on the new clip — onClipLoad will apply it once
-        // the source is ready, avoiding the race condition of seeking before load.
-        pendingSeekRef.current = {idx: nextIndex, time: 0};
-
+        pendingSeekRef.current = {idx: nextIdx, time: 0};
+        setPendingSeekTarget(nextIdx);
         setIsLoading(true);
         needsProgressClearRef.current = true;
 
         setActivePlayer(nextPlayer);
-        setCurrentIndex(nextIndex);
-
-        // If the inactive player already has this clip loaded (preload finished
-        // before the switch), seek immediately — onLoad won't fire again.
-        checkAndFlushPendingSeek(nextPlayer, nextIndex);
-
+        setCurrentIndex(nextIdx);
+        flushPendingSeek(nextPlayer, nextIdx);
         bumpVersion();
       } else {
         clearTimer();
-        finalizeClipWatch(idx);
+        finalizeClip(clipIdx);
 
-        // ✅ 最后一段结束：把 time 推到 duration（如果已知），让 UI 贴底
-        const dur = durations[idx];
+        const dur = durations[clipIdx] ?? 0;
         const endT = Number.isFinite(dur) ? dur : currentTimeRef.current;
         currentTimeRef.current = endT;
 
@@ -373,154 +295,184 @@ export function useVideoSequencePlayer({
             prev.length === urls.length
               ? [...prev]
               : Array(urls.length).fill(0);
-          next[idx] = endT;
+          next[clipIdx] = endT;
           return next;
         });
 
         bumpVersion();
         setPlaying(false);
 
-        const totalDuration = getKnownTotalDuration();
-        const watched = watchedSecondsRef.current;
-        setHasCompletedPlayback(
-          totalDuration > 0 &&
-            watched >= totalDuration * COMPLETION_WATCH_RATIO,
-        );
+        const total = getTotalDuration();
+        if (
+          allDurationsKnown() &&
+          total > 0 &&
+          watchedSecondsRef.current >= total * COMPLETION_RATIO
+        ) {
+          setHasCompletedPlayback(true);
+        }
       }
     },
     [
       activePlayerRef,
-      bumpVersion,
-      checkAndFlushPendingSeek,
-      clearTimer,
       currentIndexRef,
+      bumpVersion,
+      clearTimer,
       durations,
-      finalizeClipWatch,
-      getKnownTotalDuration,
+      finalizeClip,
+      flushPendingSeek,
+      getTotalDuration,
+      allDurationsKnown,
       urls.length,
     ],
   );
 
-  // ---------------- public API ----------------
+  const onBuffer = useCallback(
+    (playerIdx: number, e: any) => {
+      if (playerIdx !== activePlayerRef.current) return;
+      const buf = !!e?.isBuffering;
+      if (prevBufferingRef.current !== buf) {
+        prevBufferingRef.current = buf;
+        setIsBuffering(buf);
+      }
+    },
+    [activePlayerRef],
+  );
 
+  const onError = useCallback(
+    (playerIdx: number, e: any) => {
+      if (playerIdx !== activePlayerRef.current) return;
+      setIsLoading(false);
+      setError(e);
+    },
+    [activePlayerRef],
+  );
+
+  // ======================= 稳定回调包装（改用 useLatestRef） =======================
+  const callbacksRef = useLatestRef({
+    onLoad,
+    onProgress,
+    onEnd,
+    onBuffer,
+    onError,
+  });
+
+  const stableRef = useRef({
+    onLoad: (pi: number, ci: number, e: any) =>
+      callbacksRef.current.onLoad(pi, ci, e),
+    onProgress: (ci: number, e: any) => callbacksRef.current.onProgress(ci, e),
+    onEnd: (ci: number, pi: number) => callbacksRef.current.onEnd(ci, pi),
+    onBuffer: (pi: number, e: any) => callbacksRef.current.onBuffer(pi, e),
+    onError: (pi: number, e: any) => callbacksRef.current.onError(pi, e),
+  });
+
+  // ======================= 公共 API =======================
   const seekToClip = useCallback(
-    (idx: number, localSeconds: number, opts?: SeekToClipOptions) => {
-      if (urls.length === 0) {
-        return;
-      }
-
+    (idx: number, localSeconds: number, opts?: SeekOptions) => {
+      if (urls.length === 0) return;
       const play = opts?.play ?? true;
-
       const nextIdx = Math.max(0, Math.min(urls.length - 1, idx));
-
       let t = Math.max(0, Number(localSeconds) || 0);
+      const dur = durations[nextIdx] ?? 0;
+      if (Number.isFinite(dur) && t > dur) t = dur;
 
-      // ✅ clamp
-      const dur = durations[nextIdx];
-      if (Number.isFinite(dur) && t > dur) {
-        t = dur;
-      }
-
+      setHasCompletedPlayback(false);
       applyLocalTime(nextIdx, t);
       lastProgressRef.current = {idx: nextIdx, time: t};
 
       if (nextIdx !== currentIndexRef.current) {
         const nextPlayer = activePlayerRef.current === 0 ? 1 : 0;
         pendingSeekRef.current = {idx: nextIdx, time: t};
-
+        setPendingSeekTarget(nextIdx);
         setIsLoading(true);
         needsProgressClearRef.current = true;
-
         setActivePlayer(nextPlayer);
         setCurrentIndex(nextIdx);
-        // If the inactive player already loaded this clip, seek immediately
-        // rather than waiting for an onLoad that will never fire again.
-        checkAndFlushPendingSeek(nextPlayer, nextIdx);
+        flushPendingSeek(nextPlayer, nextIdx);
       } else {
-        seekOnActivePlayer(t);
+        seekOnActive(t);
       }
 
-      if (play) {
-        setPlaying(true);
-      }
+      if (play) setPlaying(true);
     },
     [
-      activePlayerRef,
       applyLocalTime,
-      checkAndFlushPendingSeek,
+      flushPendingSeek,
       currentIndexRef,
+      activePlayerRef,
       durations,
-      seekOnActivePlayer,
+      seekOnActive,
       urls.length,
     ],
   );
 
   const queueResumeForCurrentClip = useCallback((): SeekRequest => {
-    const idx = currentIndex;
-
-    // Prefer ref for the freshest playback time; fall back to state snapshot.
+    const idx = currentIndexRef.current;
     const localT =
       Number.isFinite(currentTimeRef.current) && currentTimeRef.current >= 0
         ? currentTimeRef.current
-        : times[idx] ?? 0;
-
+        : timesRef.current[idx] ?? 0;
     const payload = {idx, time: localT};
     pendingResumeRef.current = payload;
-    // Show loading until onProgress confirms frame rendering after remount.
     setIsLoading(true);
     needsProgressClearRef.current = true;
-
+    resumeKeyRef.current += 1;
+    setResumeVersion(v => v + 1);
     return payload;
-  }, [currentIndex, times]);
+  }, []);
 
   const seekVirtual = useCallback(
-    (t: number, opts?: SeekToClipOptions) => {
-      if (!getClipForTime) {
-        return;
-      }
+    (t: number, opts?: SeekOptions) => {
+      if (!getClipForTime) return;
       const r = getClipForTime(t);
       seekToClip(r.idx, r.local, opts);
     },
     [getClipForTime, seekToClip],
   );
 
-  // Compute inactive player's preload target: either currentIndex+1 (normal flow)
-  // or explicit pending seek target if cross-clip seek is in flight.
-  // NOTE: We intentionally do NOT include pendingSeekRef in deps because React cannot
-  // track ref.current changes. However, pendingSeekRef mutations are always paired with
-  // currentIndex state changes, so we capture updates indirectly via currentIndex.
-  const inactiveTargetIndex = useMemo(() => {
-    if (urls.length === 0) {
-      return -1;
+  const inactiveIndex = useMemo(() => {
+    if (urls.length === 0) return -1;
+    if (pendingSeekTarget !== null && pendingSeekTarget !== currentIndex) {
+      return Math.min(pendingSeekTarget + 1, urls.length - 1);
     }
-
-    if (pendingSeekRef.current && pendingSeekRef.current.idx !== currentIndex) {
-      // Cross-clip seek in flight: preload the seek target + 1.
-      return Math.min(pendingSeekRef.current.idx + 1, urls.length - 1);
-    }
-    // Normal case: preload next segment.
     return Math.min(currentIndex + 1, urls.length - 1);
-  }, [currentIndex, urls.length]);
+  }, [currentIndex, urls.length, pendingSeekTarget]);
 
-  // ---------------- buffer events ----------------
+  useLayoutEffect(() => {
+    [0, 1].forEach(i => {
+      const isActive = i === activePlayer;
+      const videoIndex = isActive ? currentIndex : inactiveIndex;
+      if (videoIndex < 0 || videoIndex >= urls.length) {
+        loadedSlotRef.current[i] = null;
+      }
+    });
+  }, [activePlayer, currentIndex, inactiveIndex, urls.length]);
 
-  const onClipBuffer = useCallback((clipIdx: number, e: any) => {
-    const buf = !!e?.isBuffering;
-    if (prevBufferingRef.current !== buf) {
-      prevBufferingRef.current = buf;
-      setIsBuffering(buf);
-    }
-  }, []);
-
-  // ---------------- video slots ----------------
+  useEffect(() => {
+    clearTimer();
+    setActivePlayer(0);
+    setCurrentIndex(0);
+    setPlaying(false);
+    setHasCompletedPlayback(false);
+    currentTimeRef.current = 0;
+    watchedSecondsRef.current = 0;
+    lastProgressRef.current = null;
+    pendingSeekRef.current = null;
+    pendingResumeRef.current = null;
+    setPendingSeekTarget(null);
+    loadedSlotRef.current = {0: null, 1: null};
+    setTimes(Array(urls.length).fill(0));
+    setIsLoading(true);
+    setIsBuffering(false);
+    setError(null);
+    prevBufferingRef.current = false;
+    needsProgressClearRef.current = true;
+    bumpVersion();
+  }, [urls, bumpVersion, clearTimer]);
 
   const videoSlots: VideoSlotProps[] = useMemo(() => {
     return [0, 1].map(i => {
       const isActive = i === activePlayer;
-
-      // Inactive player preloads inactiveTargetIndex (computed from currentIndex
-      // and pending seek, so always stays in sync without needing a separate state).
-      const videoIndex = isActive ? currentIndex : inactiveTargetIndex;
+      const videoIndex = isActive ? currentIndex : inactiveIndex;
 
       if (videoIndex < 0 || videoIndex >= urls.length) {
         return {
@@ -531,56 +483,57 @@ export function useVideoSequencePlayer({
           onProgress: undefined,
           onEnd: undefined,
           onBuffer: undefined,
+          onError: undefined,
         };
       }
 
-      const uri = urls[videoIndex];
-      const source = uri ? {uri, bufferConfig: {cacheSizeMB: 200}} : undefined;
+      let uri = urls[videoIndex] ?? '';
+      if (isActive && pendingResumeRef.current) {
+        const sep = uri.includes('?') ? '&' : '?';
+        uri = `${uri}${sep}_resume=${resumeKeyRef.current}`;
+      }
 
       return {
         ref: playerRefs[i],
-        source,
+        source: uri ? {uri, bufferConfig: BUFFER_CONFIG} : undefined,
         paused: isActive ? !playing : true,
-        // Both slots bind onLoad so loadedSlotRef stays accurate for preloaded clips.
-        onLoad: (e: any) => onClipLoad(i, videoIndex, e),
+        onLoad: (e: any) => stableRef.current.onLoad(i, videoIndex, e),
         onProgress: isActive
-          ? (e: any) => onClipProgress(videoIndex, e)
+          ? (e: any) => stableRef.current.onProgress(videoIndex, e)
           : undefined,
-        onEnd: isActive ? () => onEnd(videoIndex) : undefined,
-        onBuffer: (e: any) => onClipBuffer(videoIndex, e),
+        onEnd: isActive
+          ? () => stableRef.current.onEnd(videoIndex, i)
+          : undefined,
+        onBuffer: (e: any) => stableRef.current.onBuffer(i, e),
+        onError: (e: any) => stableRef.current.onError(i, e),
       };
     });
   }, [
     activePlayer,
     currentIndex,
-    inactiveTargetIndex,
-    onClipBuffer,
-    onClipLoad,
-    onClipProgress,
-    onEnd,
+    inactiveIndex,
     playerRefs,
     playing,
     urls,
+    resumeVersion,
+    resumeCleanupVersion,
   ]);
 
   return {
     videoSlots,
     activePlayer,
-
     playing,
     setPlaying,
     playingRef,
     hasCompletedPlayback,
-
     isLoading,
     setIsLoading,
     isBuffering,
-
+    error,
     currentIndex,
     currentTimeRef,
     times,
     version,
-
     seekToClip,
     seekVirtual,
     queueResumeForCurrentClip,
