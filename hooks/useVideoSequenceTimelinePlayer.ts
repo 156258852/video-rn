@@ -1,4 +1,4 @@
-import {useCallback, useMemo, useState} from 'react';
+import {useCallback, useMemo} from 'react';
 
 import {useVideoDurations} from './useVideoDurations';
 import {useVideoSequencePlayer} from './useVideoSequencePlayer';
@@ -11,14 +11,12 @@ type UseVideoSequenceTimelinePlayerParams = {
 export function useVideoSequenceTimelinePlayer({
   urls,
 }: UseVideoSequenceTimelinePlayerParams) {
-  const [isSeeking, setIsSeeking] = useState(false);
   const {durations, recordDuration, preloadNode} = useVideoDurations(urls);
 
   const player = useVideoSequencePlayer({
     urls,
     durations,
     recordDuration,
-    isSeeking,
   });
 
   // Use times[currentIndex] (state) as currentTime so useVirtualTimeline
@@ -32,10 +30,6 @@ export function useVideoSequenceTimelinePlayer({
     currentTime,
     version: player.version,
   });
-
-  const totalSafe = useMemo(() => {
-    return timeline.ready ? timeline.total : 1;
-  }, [timeline.ready, timeline.total]);
 
   // Override seekVirtual: resolve virtual time → clip+local via timeline,
   // then delegate to player.seekToClip. Explicit to avoid ambiguity with
@@ -61,7 +55,6 @@ export function useVideoSequenceTimelinePlayer({
     playingRef: player.playingRef,
     hasCompletedPlayback: player.hasCompletedPlayback,
     isLoading: player.isLoading,
-    setIsLoading: player.setIsLoading,
     isBuffering: player.isBuffering,
     currentIndex: player.currentIndex,
     currentTimeRef: player.currentTimeRef,
@@ -70,12 +63,12 @@ export function useVideoSequenceTimelinePlayer({
     ready: timeline.ready,
     virtualTime: timeline.virtualTime,
     total: timeline.total,
-    totalSafe,
+    totalSafe: timeline.totalSafe,
     offsets: timeline.offsets,
 
     // scrubber / seek helpers
-    isSeeking,
-    setIsSeeking,
+    isSeeking: player.isSeeking,
+    setIsSeeking: player.setIsSeeking,
     seekVirtual,
     queueResumeForCurrentClip: player.queueResumeForCurrentClip,
   };

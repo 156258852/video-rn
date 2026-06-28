@@ -19,6 +19,7 @@ type UseVirtualTimelineResult = {
   virtualTime: number;
   getClipForTime: (t: number) => ClipForTime;
   clampVirtualTime: (t: number) => number;
+  totalSafe: number;
 };
 
 export function useVirtualTimeline({
@@ -160,6 +161,8 @@ export function useVirtualTimeline({
     [clampVirtualTime, durations, findClipIndex, offsets],
   );
 
+  const totalSafe = ready ? total : 0;
+
   return {
     offsets,
     total,
@@ -167,5 +170,6 @@ export function useVirtualTimeline({
     virtualTime,
     getClipForTime,
     clampVirtualTime,
+    totalSafe,
   };
 }
