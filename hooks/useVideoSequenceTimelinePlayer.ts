@@ -1,4 +1,4 @@
-import {useCallback, useState} from 'react';
+import {useCallback} from 'react';
 
 import {useVideoDurations} from './useVideoDurations';
 import {useVideoSequencePlayer} from './useVideoSequencePlayer';
@@ -27,7 +27,6 @@ export function useVideoSequenceTimelinePlayer({
   recordDuration: externalRecordDuration,
   enablePreload = true,
 }: UseVideoSequenceTimelinePlayerParams) {
-  const [isSeeking, setIsSeeking] = useState(false);
   const durationState = useVideoDurations(urls, {enabled: enablePreload});
   const durations = externalDurations ?? durationState.durations;
   const recordDuration = externalRecordDuration ?? durationState.recordDuration;
@@ -37,7 +36,6 @@ export function useVideoSequenceTimelinePlayer({
     urls,
     durations,
     recordDuration,
-    isSeeking,
     onClipEnd,
   });
 
@@ -91,8 +89,8 @@ export function useVideoSequenceTimelinePlayer({
     offsets: timeline.offsets,
 
     // scrubber / seek helpers
-    isSeeking,
-    setIsSeeking,
+    isSeeking: player.isSeeking,
+    setIsSeeking: player.setIsSeeking,
     seekVirtual,
     queueResumeForCurrentClip: player.queueResumeForCurrentClip,
   };

@@ -218,7 +218,11 @@ export function useScrubber({
       onPanResponderRelease: () => {
         const x = scrubCurrentXRef.current;
         setIsSeeking(false);
-        onSeekingChangeRef.current?.(false);
+        // NOTE: Do NOT call onSeekingChange(false) here. The player's isSeeking
+        // stays true until SEEK_APPLIED clears it, which prevents stale native
+        // PROGRESS/END events from being accepted during the seek operation.
+        // onSeekingChange(false) is still called in onPanResponderTerminate as
+        // a fallback for cancelled gestures (no seek dispatched).
 
         const w = trackWRef.current;
         const tot = totalRef.current;

@@ -27,7 +27,6 @@ type Params = {
   urls: string[];
   durations: number[];
   recordDuration?: (idx: number, durationSeconds: number) => void;
-  isSeeking: boolean;
   getClipForTime?: (t: number) => ClipForTime;
   onClipEnd?: (payload: ClipEndPayload) => void;
 };
@@ -63,8 +62,9 @@ type State = {
   phase: Phase;
   wantPlaying: boolean;
 
-  // External user gesture state (e.g. user is dragging the seek bar)
-  externalSeeking: boolean;
+  // External user gesture state (e.g. user is dragging the seek bar).
+  // Orthogonal to playback phase; only gates PROGRESS ingestion.
+  isSeeking: boolean;
 
   currentIndex: number;
   currentTime: number;
@@ -87,14 +87,9 @@ type State = {
 };
 
 type Action =
-  | {
-      type: 'INIT';
-      urlsLength: number;
-      firstUri: string;
-      externalSeeking: boolean;
-    }
+  | {type: 'INIT'; urlsLength: number; firstUri: string}
   | {type: 'SET_PLAYING'; playing: boolean}
-  | {type: 'SET_EXTERNAL_SEEKING'; isSeeking: boolean}
+  | {type: 'SET_SEEKING'; isSeeking: boolean}
   | {
       type: 'SEEK_TO_CLIP';
       nextIdx: number;
@@ -105,12 +100,7 @@ type Action =
   | {type: 'SEEK_WITHIN_CLIP'; time: number; play: boolean}
   | {type: 'SEEK_APPLIED'; seekToken: number}
   | {type: 'PRELOAD_SLOT'; slot: Slot; clipIdx: number; uri: string}
-  | {
-      type: 'RELOAD_ACTIVE';
-      idx: number;
-      time: number;
-      newUri: string;
-    }
+  | {type: 'RELOAD_ACTIVE'; idx: number; time: number; newUri: string}
   | {
       type: 'LOAD_SUCCESS';
       slot: Slot;
@@ -152,6 +142,23 @@ type Action =
       loadKey: number;
       error: any;
     };
+
+// Action subtype aliases for type-safe guard/patch helpers.
+type AInit = Extract<Action, {type: 'INIT'}>;
+type ASetPlaying = Extract<Action, {type: 'SET_PLAYING'}>;
+type ASetSeeking = Extract<Action, {type: 'SET_SEEKING'}>;
+type ASeekToClip = Extract<Action, {type: 'SEEK_TO_CLIP'}>;
+type ASeekWithin = Extract<Action, {type: 'SEEK_WITHIN_CLIP'}>;
+type ASeekApplied = Extract<Action, {type: 'SEEK_APPLIED'}>;
+type APreload = Extract<Action, {type: 'PRELOAD_SLOT'}>;
+type AReload = Extract<Action, {type: 'RELOAD_ACTIVE'}>;
+type ALoadSuccess = Extract<Action, {type: 'LOAD_SUCCESS'}>;
+type AProgress = Extract<Action, {type: 'PROGRESS'}>;
+type AEnd = Extract<Action, {type: 'END'}>;
+type ABuferr = Extract<Action, {type: 'BUFFER'}>;
+type AError = Extract<Action, {type: 'ERROR'}>;
+// Any action carrying a {slot, clipIdx, uri, loadKey} identity payload.
+type EvtAction = Extract<Action, {slot: Slot; loadKey: number}>;
 
 function otherSlot(s: Slot): Slot {
   return s === 0 ? 1 : 0;
@@ -220,7 +227,7 @@ function initialState(): State {
     slotLoadedKey: [null, null],
     phase: 'idle',
     wantPlaying: false,
-    externalSeeking: false,
+    isSeeking: false,
     currentIndex: 0,
     currentTime: 0,
     times: [],
@@ -237,570 +244,751 @@ function initialState(): State {
   };
 }
 
-function reducer(state: State, action: Action): State {
-  switch (action.type) {
-    case 'INIT': {
-      const {urlsLength} = action;
-      if (urlsLength <= 0) return initialState();
+// ---------------------------------------------------------------------------
+// 2D phase x phase transition matrix
+// ---------------------------------------------------------------------------
+// TRANSITIONS[from][to] = Rule[] — a true 2D grid where rows = source phase,
+// columns = target phase. Each Rule fires when its `action` matches and
+// (optional) `guard` passes; the reducer applies `patch` and sets `phase = to`.
+// Empty cells = rejected transitions (illegal). Diagonal cells (to === from)
+// hold side-effect-only rules that don't change phase.
+// ---------------------------------------------------------------------------
 
-      const first: SlotInfo = {
-        clipIdx: 0,
-        uri: action.firstUri,
-        loadKey: 1,
-      };
+type Rule = {
+  action: Action['type'];
+  guard?: (s: State, a: Action) => boolean;
+  patch: (s: State, a: Action) => Partial<State>;
+};
+type Matrix = Record<Phase, Partial<Record<Phase, Rule[]>>>;
 
-      return {
-        ...initialState(),
-        urlsLength,
-        slots: [first, null],
-        slotLoadedKey: [null, null],
-        activeSlot: 0,
-        phase: action.firstUri ? 'loading' : 'idle',
-        isLoading: !!action.firstUri,
-        needsProgressClear: !!action.firstUri,
-        loadKeySeed: 1,
-        times: Array(urlsLength).fill(0),
-        externalSeeking: action.externalSeeking,
-      };
-    }
+// Phase iteration order for the reducer. Multi-target actions (e.g. SEEK_TO_CLIP,
+// LOAD_SUCCESS, END) use exclusive guards, so iteration order does not affect
+// which rule fires — it only determines which cell is visited first.
+const PHASE_ORDER: Phase[] = [
+  'idle',
+  'loading',
+  'loadedPendingSeek',
+  'seeking',
+  'ready',
+  'ended',
+  'error',
+];
 
-    case 'SET_PLAYING': {
-      // If the user pauses while we're waiting for a "settling" PROGRESS after seek,
-      // we should not rely on PROGRESS to exit the intermediate state.
-      if (!action.playing && state.phase === 'seeking') {
-        return {
-          ...state,
-          wantPlaying: false,
-          phase: 'ready',
-          isLoading: false,
-          needsProgressClear: false,
-          pendingSeekTime: null,
-        };
-      }
+// ---- guards ----
+const assignedGuard = (s: State, a: Action): boolean => {
+  const e = a as EvtAction;
+  return isValidAssignedEvent(s, e.slot, e.clipIdx, e.uri, e.loadKey);
+};
+const activeGuard = (s: State, a: Action): boolean => {
+  const e = a as EvtAction;
+  return isValidActiveEvent(s, e.slot, e.clipIdx, e.uri, e.loadKey);
+};
+const inactiveAssignedGuard = (s: State, a: Action): boolean =>
+  assignedGuard(s, a) && (a as EvtAction).slot !== s.activeSlot;
+const hasPending = (s: State) => s.seekToken !== s.appliedSeekToken;
+const noPending = (s: State) => s.seekToken === s.appliedSeekToken;
+const playGuard = (s: State, a: Action) => (a as ASetPlaying).playing;
+const pauseGuard = (s: State, a: Action) => !(a as ASetPlaying).playing;
+const preloadGuard = (s: State, a: Action) =>
+  (a as APreload).slot !== s.activeSlot;
+const reloadGuard = (s: State, a: Action) => {
+  const act = a as AReload;
+  const existing = s.slots[s.activeSlot];
+  return !!existing && existing.clipIdx === act.idx;
+};
+const seekToClipHitGuard = (s: State, a: Action) => {
+  const act = a as ASeekToClip;
+  const inactive = otherSlot(s.activeSlot);
+  const preload = s.slots[inactive];
+  return (
+    !!preload &&
+    preload.clipIdx === act.nextIdx &&
+    preload.uri === act.uri &&
+    s.slotLoadedKey[inactive] === preload.loadKey
+  );
+};
+const seekToClipMissGuard = (s: State, a: Action) => !seekToClipHitGuard(s, a);
+const tokenGuard = (s: State, a: Action) =>
+  (a as ASeekApplied).seekToken === s.seekToken;
+// SEEK_APPLIED branches on state.wantPlaying (not an action field), matching the
+// original `nextPhase = state.wantPlaying ? 'seeking' : 'ready'`.
+const seekAppliedPlayGuard = (s: State, a: Action) =>
+  tokenGuard(s, a) && s.wantPlaying;
+const seekAppliedPauseGuard = (s: State, a: Action) =>
+  tokenGuard(s, a) && !s.wantPlaying;
+const loadSuccessActiveGuard = (s: State, a: Action) => {
+  const act = a as ALoadSuccess;
+  return (
+    isValidAssignedEvent(s, act.slot, act.clipIdx, act.uri, act.loadKey) &&
+    act.slot === s.activeSlot
+  );
+};
+const loadSuccessInactiveRecordGuard = (s: State, a: Action) => {
+  const act = a as ALoadSuccess;
+  return (
+    isValidAssignedEvent(s, act.slot, act.clipIdx, act.uri, act.loadKey) &&
+    act.slot !== s.activeSlot &&
+    s.slotLoadedKey[act.slot] !== act.loadKey
+  );
+};
+const loadSuccessAdvancePendGuard = (s: State, a: Action) =>
+  loadSuccessActiveGuard(s, a) && hasPending(s);
+const loadSuccessAdvanceReadyGuard = (s: State, a: Action) =>
+  loadSuccessActiveGuard(s, a) && noPending(s);
+const progressGuard = (s: State, a: Action) => {
+  if (!activeGuard(s, a)) return false;
+  if (s.isSeeking) return false;
+  if (s.seekToken !== s.appliedSeekToken) return false;
+  const act = a as AProgress;
+  if (s.currentIndex !== act.clipIdx) return false;
+  const t = act.time;
+  const target = s.currentTime;
+  const EPS = 0.5;
+  if (target > EPS && t < target - EPS) return false;
+  // Also reject progress significantly AHEAD of current time — catches stale
+  // events after a backward seek where oldTime > newTime (currentTime).
+  if (t > target + MAX_PROGRESS_STEP) return false;
+  return true;
+};
+const endHasNextGuard = (s: State, a: Action) => {
+  const act = a as AEnd;
+  return act.nextIdx != null && !!act.nextUri;
+};
+// Pure preload-hit check for END's next clip (no active guard semantics).
+const endPreloadHit = (s: State, a: Action) => {
+  const act = a as AEnd;
+  const nextSlot = otherSlot(s.activeSlot);
+  const preload = s.slots[nextSlot];
+  return (
+    !!preload &&
+    preload.clipIdx === act.nextIdx &&
+    preload.uri === act.nextUri &&
+    s.slotLoadedKey[nextSlot] === preload.loadKey
+  );
+};
+// All END transitions require an active-slot event (matches original guard).
+const endNoNextGuard = (s: State, a: Action) =>
+  activeGuard(s, a) && !endHasNextGuard(s, a);
+const endHitGuard = (s: State, a: Action) =>
+  activeGuard(s, a) && endHasNextGuard(s, a) && endPreloadHit(s, a);
+const endMissGuard = (s: State, a: Action) =>
+  activeGuard(s, a) && endHasNextGuard(s, a) && !endPreloadHit(s, a);
+// In `seeking`, END additionally requires the seek to have settled.
+const endNoNextSeekingGuard = (s: State, a: Action) =>
+  activeGuard(s, a) && noPending(s) && !endHasNextGuard(s, a);
+const endHitSeekingGuard = (s: State, a: Action) =>
+  activeGuard(s, a) &&
+  noPending(s) &&
+  endHasNextGuard(s, a) &&
+  endPreloadHit(s, a);
+const endMissSeekingGuard = (s: State, a: Action) =>
+  activeGuard(s, a) &&
+  noPending(s) &&
+  endHasNextGuard(s, a) &&
+  !endPreloadHit(s, a);
 
-      // Prevent "playing intent" from being set in terminal/error states.
-      if (
-        action.playing &&
-        (state.phase === 'idle' ||
-          state.phase === 'ended' ||
-          state.phase === 'error')
-      ) {
-        return state;
-      }
-
-      return {...state, wantPlaying: action.playing};
-    }
-
-    case 'SET_EXTERNAL_SEEKING': {
-      return {...state, externalSeeking: action.isSeeking};
-    }
-
-    case 'SEEK_WITHIN_CLIP': {
-      if (state.phase === 'idle' || state.phase === 'error') return state;
-
-      const times = ensureTimesLen(state.times, state.urlsLength).slice();
-      times[state.currentIndex] = action.time;
-
-      const seekToken = state.seekToken + 1;
-      const wantPlaying = action.play ? true : state.wantPlaying;
-
-      return {
-        ...state,
-        // If we're currently loading, keep `loading` but remember the pending seek.
-        phase: state.phase === 'loading' ? 'loading' : 'loadedPendingSeek',
-        wantPlaying,
-        currentTime: action.time,
-        times,
-        seekToken,
-        pendingSeekTime: action.time,
-        isBuffering: false,
-        error: null,
-      };
-    }
-
-    case 'SEEK_APPLIED': {
-      // Only accept the current seekToken that matches the imperative seek() call.
-      if (state.phase !== 'loadedPendingSeek') return state;
-      if (action.seekToken !== state.seekToken) return state;
-
-      const nextPhase = state.wantPlaying ? 'seeking' : 'ready';
-
-      return {
-        ...state,
-        phase: nextPhase,
-        appliedSeekToken: action.seekToken,
-        pendingSeekTime: state.wantPlaying ? state.pendingSeekTime : null,
-        isLoading: state.wantPlaying ? state.isLoading : false,
-        needsProgressClear: state.wantPlaying
-          ? state.needsProgressClear
-          : false,
-      };
-    }
-
-    case 'SEEK_TO_CLIP': {
-      const inactiveSlot = otherSlot(state.activeSlot);
-      const preload = state.slots[inactiveSlot];
-      const hitPreload =
-        !!preload &&
-        preload.clipIdx === action.nextIdx &&
-        preload.uri === action.uri &&
-        state.slotLoadedKey[inactiveSlot] === preload.loadKey;
-
-      const times = ensureTimesLen(state.times, state.urlsLength).slice();
-      times[action.nextIdx] = action.time;
-
-      // Fast-path: preload is already loaded; swap activeSlot and seek without entering loading.
-      if (hitPreload) {
-        const wantPlaying = action.play ? true : state.wantPlaying;
-        const seekToken = state.seekToken + 1;
-
-        return {
-          ...state,
-          wantPlaying,
-          activeSlot: inactiveSlot,
-          phase: 'loadedPendingSeek',
-          isLoading: false,
-          needsProgressClear: false,
-          isBuffering: false,
-          error: null,
-          currentIndex: action.nextIdx,
-          currentTime: action.time,
-          times,
-          seekToken,
-          pendingSeekTime: action.time,
-        };
-      }
-
-      // Fallback: preload not hit (or not loaded yet); follow the normal loading path.
-      const nextLoadKey = state.loadKeySeed + 1;
-
-      const nextSlots: [SlotInfo | null, SlotInfo | null] = [
-        ...state.slots,
-      ] as any;
-      nextSlots[inactiveSlot] = {
-        clipIdx: action.nextIdx,
-        uri: action.uri,
-        loadKey: nextLoadKey,
-      };
-
-      const slotLoadedKey: [number | null, number | null] = [
-        ...state.slotLoadedKey,
-      ] as any;
-      slotLoadedKey[inactiveSlot] = null;
-
-      return {
-        ...state,
-        wantPlaying: action.play ? true : state.wantPlaying,
-        activeSlot: inactiveSlot,
-        slots: nextSlots,
-        slotLoadedKey,
-        phase: 'loading',
-        isLoading: true,
-        needsProgressClear: true,
-        isBuffering: false,
-        error: null,
-        currentIndex: action.nextIdx,
-        currentTime: action.time,
-        times,
-        loadKeySeed: nextLoadKey,
-        seekToken: state.seekToken + 1,
-        pendingSeekTime: action.time,
-      };
-    }
-
-    case 'PRELOAD_SLOT': {
-      if (action.slot === state.activeSlot) return state;
-
-      // Allow preload refresh even for the same (clipIdx, uri) to support retry.
-      const nextLoadKey = state.loadKeySeed + 1;
-      const nextSlots: [SlotInfo | null, SlotInfo | null] = [
-        ...state.slots,
-      ] as any;
-      nextSlots[action.slot] = {
-        clipIdx: action.clipIdx,
-        uri: action.uri,
-        loadKey: nextLoadKey,
-      };
-
-      const slotLoadedKey: [number | null, number | null] = [
-        ...state.slotLoadedKey,
-      ] as any;
-      slotLoadedKey[action.slot] = null;
-
-      return {
-        ...state,
-        slots: nextSlots,
-        slotLoadedKey,
-        loadKeySeed: nextLoadKey,
-      };
-    }
-
-    case 'RELOAD_ACTIVE': {
-      // Reload: change (uri, loadKey) on the active slot to force a native reload.
-      const slot = state.activeSlot;
-      const existing = state.slots[slot];
-      if (!existing || existing.clipIdx !== action.idx) return state;
-
-      const nextLoadKey = state.loadKeySeed + 1;
-      const nextSlots: [SlotInfo | null, SlotInfo | null] = [
-        ...state.slots,
-      ] as any;
-      nextSlots[slot] = {
-        clipIdx: action.idx,
-        uri: action.newUri,
-        loadKey: nextLoadKey,
-      };
-
-      const slotLoadedKey: [number | null, number | null] = [
-        ...state.slotLoadedKey,
-      ] as any;
-      slotLoadedKey[slot] = null;
-
-      const times = ensureTimesLen(state.times, state.urlsLength).slice();
-      times[action.idx] = action.time;
-
-      return {
-        ...state,
-        slots: nextSlots,
-        slotLoadedKey,
-        phase: 'loading',
-        isLoading: true,
-        needsProgressClear: true,
-        isBuffering: false,
-        error: null,
-        currentTime: action.time,
-        times,
-        loadKeySeed: nextLoadKey,
-        seekToken: state.seekToken + 1,
-        pendingSeekTime: action.time,
-      };
-    }
-
-    case 'LOAD_SUCCESS': {
-      if (
-        !isValidAssignedEvent(
-          state,
-          action.slot,
-          action.clipIdx,
-          action.uri,
-          action.loadKey,
-        )
-      ) {
-        return state;
-      }
-
-      // Inactive slot: only record that this slot's current loadKey has loaded.
-      if (action.slot !== state.activeSlot) {
-        if (state.slotLoadedKey[action.slot] === action.loadKey) return state;
-        const slotLoadedKey: [number | null, number | null] = [
-          ...state.slotLoadedKey,
-        ] as any;
-        slotLoadedKey[action.slot] = action.loadKey;
-        return {...state, slotLoadedKey};
-      }
-
-      // Active slot: record loadedKey for consistency.
-      const slotLoadedKey: [number | null, number | null] = [
-        ...state.slotLoadedKey,
-      ] as any;
-      slotLoadedKey[action.slot] = action.loadKey;
-
-      // Some implementations may fire onLoad multiple times; ignore extra events once we're past loading.
-      if (
-        state.phase === 'ready' ||
-        state.phase === 'loadedPendingSeek' ||
-        state.phase === 'seeking'
-      ) {
-        return {...state, slotLoadedKey};
-      }
-
-      // Only loading is allowed to advance on LOAD_SUCCESS.
-      // Prevent stale LOAD_SUCCESS from resurrecting ended/error/idle.
-      if (state.phase !== 'loading') {
-        return {...state, slotLoadedKey};
-      }
-
-      const hasPendingSeek = state.seekToken !== state.appliedSeekToken;
-      const shouldWaitProgress = state.wantPlaying || hasPendingSeek;
-
-      return {
-        ...state,
-        slotLoadedKey,
-        phase: hasPendingSeek ? 'loadedPendingSeek' : 'ready',
-        error: null,
-        isBuffering: false,
-        isLoading: shouldWaitProgress ? state.isLoading : false,
-        needsProgressClear: shouldWaitProgress
-          ? state.needsProgressClear
-          : false,
-      };
-    }
-
-    case 'PROGRESS': {
-      if (
-        !isValidActiveEvent(
-          state,
-          action.slot,
-          action.clipIdx,
-          action.uri,
-          action.loadKey,
-        )
-      ) {
-        return state;
-      }
-      if (state.phase !== 'ready' && state.phase !== 'seeking') {
-        return state;
-      }
-      if (state.externalSeeking) {
-        return state;
-      }
-      if (state.seekToken !== state.appliedSeekToken) {
-        return state;
-      }
-
-      // Extra guard: only allow the active clip to update `times`.
-      if (state.currentIndex !== action.clipIdx) {
-        return state;
-      }
-
-      const t = action.time;
-      const target = state.currentTime;
-      const EPS = 0.5;
-      // Ignore stale progress emitted before seek has settled.
-      if (target > EPS && t < target - EPS) {
-        return state;
-      }
-
-      const times = ensureTimesLen(state.times, state.urlsLength).slice();
-      const prevT = state.currentTime;
-
-      let {playedSeconds} = state;
-      const delta = t - prevT;
-      if (delta > 0 && delta <= MAX_PROGRESS_STEP) {
-        playedSeconds += delta;
-      }
-
-      times[action.clipIdx] = t;
-
-      return {
-        ...state,
-        phase: 'ready',
-        currentTime: t,
-        times,
-        playedSeconds,
-        isLoading: state.needsProgressClear ? false : state.isLoading,
-        needsProgressClear: false,
-        pendingSeekTime: null,
-      };
-    }
-
-    case 'END': {
-      if (
-        !isValidActiveEvent(
-          state,
-          action.slot,
-          action.clipIdx,
-          action.uri,
-          action.loadKey,
-        )
-      ) {
-        return state;
-      }
-      if (state.phase !== 'ready' && state.phase !== 'seeking') {
-        return state;
-      }
-      if (
-        state.phase === 'seeking' &&
-        state.seekToken !== state.appliedSeekToken
-      ) {
-        return state;
-      }
-
-      const times = ensureTimesLen(state.times, state.urlsLength).slice();
-      const prevT = times[action.clipIdx] ?? state.currentTime;
-
-      let {playedSeconds} = state;
-      if (Number.isFinite(action.clipDuration) && action.clipDuration > 0) {
-        const tail = action.clipDuration - prevT;
-        if (tail > 0 && tail <= MAX_PROGRESS_STEP) {
-          playedSeconds += tail;
-        }
-      }
-
-      if (action.nextIdx == null || !action.nextUri) {
-        const endT =
-          Number.isFinite(action.clipDuration) && action.clipDuration > 0
-            ? action.clipDuration
-            : prevT;
-
-        times[action.clipIdx] = endT;
-
-        return {
-          ...state,
-          phase: 'ended',
-          wantPlaying: false,
-          currentTime: endT,
-          times,
-          playedSeconds,
-          isLoading: false,
-          needsProgressClear: false,
-          isBuffering: false,
-          sequenceEndCount: state.sequenceEndCount + 1,
-        };
-      }
-
-      const nextSlot = otherSlot(state.activeSlot);
-      const preload = state.slots[nextSlot];
-      const hitPreload =
-        !!preload &&
-        preload.clipIdx === action.nextIdx &&
-        preload.uri === action.nextUri &&
-        state.slotLoadedKey[nextSlot] === preload.loadKey;
-
-      // Finalize: write current clip to duration; reset next clip to 0.
-      if (Number.isFinite(action.clipDuration) && action.clipDuration > 0) {
-        times[action.clipIdx] = action.clipDuration;
-      }
-      times[action.nextIdx] = 0;
-
-      if (hitPreload) {
-        return {
-          ...state,
-          activeSlot: nextSlot,
-          phase: 'loadedPendingSeek',
-          isLoading: false,
-          needsProgressClear: false,
-          isBuffering: false,
-          error: null,
-          currentIndex: action.nextIdx,
-          currentTime: 0,
-          times,
-          playedSeconds,
-          seekToken: state.seekToken + 1,
-          pendingSeekTime: 0,
-        };
-      }
-
-      const nextLoadKey = state.loadKeySeed + 1;
-
-      const nextSlots: [SlotInfo | null, SlotInfo | null] = [
-        ...state.slots,
-      ] as any;
-      nextSlots[nextSlot] = {
-        clipIdx: action.nextIdx,
-        uri: action.nextUri,
-        loadKey: nextLoadKey,
-      };
-
-      const slotLoadedKey: [number | null, number | null] = [
-        ...state.slotLoadedKey,
-      ] as any;
-      slotLoadedKey[nextSlot] = null;
-
-      return {
-        ...state,
-        activeSlot: nextSlot,
-        slots: nextSlots,
-        slotLoadedKey,
-        phase: 'loading',
-        isLoading: true,
-        needsProgressClear: true,
-        isBuffering: false,
-        error: null,
-        currentIndex: action.nextIdx,
-        currentTime: 0,
-        times,
-        playedSeconds,
-        loadKeySeed: nextLoadKey,
-        seekToken: state.seekToken + 1,
-        pendingSeekTime: 0,
-      };
-    }
-
-    case 'BUFFER': {
-      if (
-        !isValidActiveEvent(
-          state,
-          action.slot,
-          action.clipIdx,
-          action.uri,
-          action.loadKey,
-        )
-      ) {
-        return state;
-      }
-      if (
-        state.phase === 'idle' ||
-        state.phase === 'ended' ||
-        state.phase === 'error'
-      ) {
-        return state;
-      }
-      return {...state, isBuffering: action.isBuffering};
-    }
-
-    case 'ERROR': {
-      // Active slot error => terminal error.
-      if (
-        isValidActiveEvent(
-          state,
-          action.slot,
-          action.clipIdx,
-          action.uri,
-          action.loadKey,
-        )
-      ) {
-        return {
-          ...state,
-          phase: 'error',
-          wantPlaying: false,
-          isLoading: false,
-          needsProgressClear: false,
-          isBuffering: false,
-          error: action.error,
-        };
-      }
-
-      // Inactive/preload slot error => invalidate preload only.
-      // Do not retry here.
-      // This prevents a previously loaded preload from being used after it later errors.
-      if (
-        isValidAssignedEvent(
-          state,
-          action.slot,
-          action.clipIdx,
-          action.uri,
-          action.loadKey,
-        )
-      ) {
-        const nextSlots: [SlotInfo | null, SlotInfo | null] = [
-          ...state.slots,
-        ] as any;
-        const slotLoadedKey: [number | null, number | null] = [
-          ...state.slotLoadedKey,
-        ] as any;
-        nextSlots[action.slot] = null;
-        slotLoadedKey[action.slot] = null;
-        return {
-          ...state,
-          slots: nextSlots,
-          slotLoadedKey,
-        };
-      }
-
-      return state;
-    }
-
-    default:
-      return state;
+// ---- patches ----
+const setSeekingPatch = (s: State, a: Action): Partial<State> => ({
+  isSeeking: (a as ASetSeeking).isSeeking,
+});
+const setPlayingSelfPatch = (s: State, a: Action): Partial<State> => ({
+  wantPlaying: (a as ASetPlaying).playing,
+});
+const setPlayingPauseSeekingPatch = (): Partial<State> => ({
+  wantPlaying: false,
+  isLoading: false,
+  needsProgressClear: false,
+  pendingSeekTime: null,
+});
+const preloadPatch = (s: State, a: Action): Partial<State> => {
+  const act = a as APreload;
+  const nextLoadKey = s.loadKeySeed + 1;
+  const slots: [SlotInfo | null, SlotInfo | null] = [...s.slots] as any;
+  slots[act.slot] = {clipIdx: act.clipIdx, uri: act.uri, loadKey: nextLoadKey};
+  const slotLoadedKey: [number | null, number | null] = [
+    ...s.slotLoadedKey,
+  ] as any;
+  slotLoadedKey[act.slot] = null;
+  return {slots, slotLoadedKey, loadKeySeed: nextLoadKey};
+};
+const bufferPatch = (s: State, a: Action): Partial<State> => ({
+  isBuffering: (a as ABuferr).isBuffering,
+});
+const recordLoadedKeyPatch = (s: State, a: Action): Partial<State> => {
+  const act = a as ALoadSuccess;
+  const slotLoadedKey: [number | null, number | null] = [
+    ...s.slotLoadedKey,
+  ] as any;
+  slotLoadedKey[act.slot] = act.loadKey;
+  return {slotLoadedKey};
+};
+const seekWithinPatch = (s: State, a: Action): Partial<State> => {
+  const act = a as ASeekWithin;
+  const times = ensureTimesLen(s.times, s.urlsLength).slice();
+  times[s.currentIndex] = act.time;
+  return {
+    wantPlaying: act.play ? true : s.wantPlaying,
+    currentTime: act.time,
+    times,
+    seekToken: s.seekToken + 1,
+    pendingSeekTime: act.time,
+    isBuffering: false,
+    error: null,
+  };
+};
+const seekToClipHitPatch = (s: State, a: Action): Partial<State> => {
+  const act = a as ASeekToClip;
+  const inactive = otherSlot(s.activeSlot);
+  const times = ensureTimesLen(s.times, s.urlsLength).slice();
+  times[act.nextIdx] = act.time;
+  return {
+    wantPlaying: act.play ? true : s.wantPlaying,
+    activeSlot: inactive,
+    isLoading: false,
+    needsProgressClear: false,
+    isBuffering: false,
+    error: null,
+    currentIndex: act.nextIdx,
+    currentTime: act.time,
+    times,
+    seekToken: s.seekToken + 1,
+    pendingSeekTime: act.time,
+  };
+};
+const seekToClipMissPatch = (s: State, a: Action): Partial<State> => {
+  const act = a as ASeekToClip;
+  const inactive = otherSlot(s.activeSlot);
+  const nextLoadKey = s.loadKeySeed + 1;
+  const slots: [SlotInfo | null, SlotInfo | null] = [...s.slots] as any;
+  slots[inactive] = {clipIdx: act.nextIdx, uri: act.uri, loadKey: nextLoadKey};
+  const slotLoadedKey: [number | null, number | null] = [
+    ...s.slotLoadedKey,
+  ] as any;
+  slotLoadedKey[inactive] = null;
+  const times = ensureTimesLen(s.times, s.urlsLength).slice();
+  times[act.nextIdx] = act.time;
+  return {
+    wantPlaying: act.play ? true : s.wantPlaying,
+    activeSlot: inactive,
+    slots,
+    slotLoadedKey,
+    isLoading: true,
+    needsProgressClear: true,
+    isBuffering: false,
+    error: null,
+    currentIndex: act.nextIdx,
+    currentTime: act.time,
+    times,
+    loadKeySeed: nextLoadKey,
+    seekToken: s.seekToken + 1,
+    pendingSeekTime: act.time,
+  };
+};
+const seekAppliedPatch = (s: State, a: Action): Partial<State> => {
+  const act = a as ASeekApplied;
+  // Clear isSeeking here (not on scrubber release) so that PROGRESS and END
+  // events stay gated during the entire seek operation — from drag start
+  // through SEEK_APPLIED. This prevents stale native events (old position)
+  // from being accepted in the window between scrubber release and the
+  // video player actually completing the seek.
+  if (s.wantPlaying) {
+    return {appliedSeekToken: act.seekToken, isSeeking: false};
   }
+  return {
+    appliedSeekToken: act.seekToken,
+    isSeeking: false,
+    pendingSeekTime: null,
+    isLoading: false,
+    needsProgressClear: false,
+  };
+};
+const reloadActivePatch = (s: State, a: Action): Partial<State> => {
+  const act = a as AReload;
+  const slot = s.activeSlot;
+  const nextLoadKey = s.loadKeySeed + 1;
+  const slots: [SlotInfo | null, SlotInfo | null] = [...s.slots] as any;
+  slots[slot] = {clipIdx: act.idx, uri: act.newUri, loadKey: nextLoadKey};
+  const slotLoadedKey: [number | null, number | null] = [
+    ...s.slotLoadedKey,
+  ] as any;
+  slotLoadedKey[slot] = null;
+  const times = ensureTimesLen(s.times, s.urlsLength).slice();
+  times[act.idx] = act.time;
+  return {
+    slots,
+    slotLoadedKey,
+    isLoading: true,
+    needsProgressClear: true,
+    isBuffering: false,
+    error: null,
+    currentTime: act.time,
+    times,
+    loadKeySeed: nextLoadKey,
+    seekToken: s.seekToken + 1,
+    pendingSeekTime: act.time,
+  };
+};
+const loadSuccessAdvancePatch = (s: State, a: Action): Partial<State> => {
+  const base = recordLoadedKeyPatch(s, a);
+  if (hasPending(s)) {
+    return {...base, error: null, isBuffering: false};
+  }
+  const shouldWait = s.wantPlaying;
+  return {
+    ...base,
+    error: null,
+    isBuffering: false,
+    isLoading: shouldWait ? s.isLoading : false,
+    needsProgressClear: shouldWait ? s.needsProgressClear : false,
+  };
+};
+const progressPatch = (s: State, a: Action): Partial<State> => {
+  const act = a as AProgress;
+  const t = act.time;
+  const times = ensureTimesLen(s.times, s.urlsLength).slice();
+  const prevT = s.currentTime;
+  let {playedSeconds} = s;
+  const delta = t - prevT;
+  if (delta > 0 && delta <= MAX_PROGRESS_STEP) {
+    playedSeconds += delta;
+  }
+  times[act.clipIdx] = t;
+  return {
+    currentTime: t,
+    times,
+    playedSeconds,
+    isLoading: s.needsProgressClear ? false : s.isLoading,
+    needsProgressClear: false,
+    pendingSeekTime: null,
+  };
+};
+const endTailPlayed = (s: State, a: Action) => {
+  const act = a as AEnd;
+  const times = ensureTimesLen(s.times, s.urlsLength).slice();
+  const prevT = times[act.clipIdx] ?? s.currentTime;
+  let {playedSeconds} = s;
+  if (Number.isFinite(act.clipDuration) && act.clipDuration > 0) {
+    const tail = act.clipDuration - prevT;
+    if (tail > 0 && tail <= MAX_PROGRESS_STEP) {
+      playedSeconds += tail;
+    }
+  }
+  return {times, prevT, playedSeconds};
+};
+const endEndedPatch = (s: State, a: Action): Partial<State> => {
+  const act = a as AEnd;
+  const {times, prevT, playedSeconds} = endTailPlayed(s, a);
+  const endT =
+    Number.isFinite(act.clipDuration) && act.clipDuration > 0
+      ? act.clipDuration
+      : prevT;
+  times[act.clipIdx] = endT;
+  return {
+    wantPlaying: false,
+    currentTime: endT,
+    times,
+    playedSeconds,
+    isLoading: false,
+    needsProgressClear: false,
+    isBuffering: false,
+    sequenceEndCount: s.sequenceEndCount + 1,
+  };
+};
+const endHitPatch = (s: State, a: Action): Partial<State> => {
+  const act = a as AEnd;
+  const nextSlot = otherSlot(s.activeSlot);
+  const {times, playedSeconds} = endTailPlayed(s, a);
+  if (Number.isFinite(act.clipDuration) && act.clipDuration > 0) {
+    times[act.clipIdx] = act.clipDuration;
+  }
+  times[act.nextIdx!] = 0;
+  return {
+    activeSlot: nextSlot,
+    isLoading: false,
+    needsProgressClear: false,
+    isBuffering: false,
+    error: null,
+    currentIndex: act.nextIdx!,
+    currentTime: 0,
+    times,
+    playedSeconds,
+    seekToken: s.seekToken + 1,
+    pendingSeekTime: 0,
+  };
+};
+const endMissPatch = (s: State, a: Action): Partial<State> => {
+  const act = a as AEnd;
+  const nextSlot = otherSlot(s.activeSlot);
+  const nextLoadKey = s.loadKeySeed + 1;
+  const {times, playedSeconds} = endTailPlayed(s, a);
+  if (Number.isFinite(act.clipDuration) && act.clipDuration > 0) {
+    times[act.clipIdx] = act.clipDuration;
+  }
+  times[act.nextIdx!] = 0;
+  const slots: [SlotInfo | null, SlotInfo | null] = [...s.slots] as any;
+  slots[nextSlot] = {
+    clipIdx: act.nextIdx!,
+    uri: act.nextUri!,
+    loadKey: nextLoadKey,
+  };
+  const slotLoadedKey: [number | null, number | null] = [
+    ...s.slotLoadedKey,
+  ] as any;
+  slotLoadedKey[nextSlot] = null;
+  return {
+    activeSlot: nextSlot,
+    slots,
+    slotLoadedKey,
+    isLoading: true,
+    needsProgressClear: true,
+    isBuffering: false,
+    error: null,
+    currentIndex: act.nextIdx!,
+    currentTime: 0,
+    times,
+    playedSeconds,
+    loadKeySeed: nextLoadKey,
+    seekToken: s.seekToken + 1,
+    pendingSeekTime: 0,
+  };
+};
+const errorActivePatch = (s: State, a: Action): Partial<State> => ({
+  wantPlaying: false,
+  isLoading: false,
+  needsProgressClear: false,
+  isBuffering: false,
+  error: (a as AError).error,
+});
+const errorInactivePatch = (s: State, a: Action): Partial<State> => {
+  const act = a as AError;
+  const slots: [SlotInfo | null, SlotInfo | null] = [...s.slots] as any;
+  const slotLoadedKey: [number | null, number | null] = [
+    ...s.slotLoadedKey,
+  ] as any;
+  slots[act.slot] = null;
+  slotLoadedKey[act.slot] = null;
+  return {slots, slotLoadedKey};
+};
+
+// Shared side-effect-only self rules (referenced by every row's self cell).
+const SET_SEEKING_RULE: Rule = {
+  action: 'SET_SEEKING',
+  patch: setSeekingPatch,
+};
+const PRELOAD_RULE: Rule = {
+  action: 'PRELOAD_SLOT',
+  guard: preloadGuard,
+  patch: preloadPatch,
+};
+const ERROR_INACTIVE_RULE: Rule = {
+  action: 'ERROR',
+  guard: inactiveAssignedGuard,
+  patch: errorInactivePatch,
+};
+const LOAD_SUCCESS_RECORD_INACTIVE: Rule = {
+  action: 'LOAD_SUCCESS',
+  guard: loadSuccessInactiveRecordGuard,
+  patch: recordLoadedKeyPatch,
+};
+const LOAD_SUCCESS_RECORD_ACTIVE: Rule = {
+  action: 'LOAD_SUCCESS',
+  guard: loadSuccessActiveGuard,
+  patch: recordLoadedKeyPatch,
+};
+
+const TRANSITIONS: Matrix = {
+  idle: {
+    loading: [
+      {
+        action: 'SEEK_TO_CLIP',
+        guard: seekToClipMissGuard,
+        patch: seekToClipMissPatch,
+      },
+      {action: 'RELOAD_ACTIVE', guard: reloadGuard, patch: reloadActivePatch},
+    ],
+    loadedPendingSeek: [
+      {
+        action: 'SEEK_TO_CLIP',
+        guard: seekToClipHitGuard,
+        patch: seekToClipHitPatch,
+      },
+    ],
+    error: [{action: 'ERROR', guard: activeGuard, patch: errorActivePatch}],
+    idle: [
+      SET_SEEKING_RULE,
+      PRELOAD_RULE,
+      {action: 'SET_PLAYING', guard: pauseGuard, patch: setPlayingSelfPatch},
+      LOAD_SUCCESS_RECORD_ACTIVE,
+      LOAD_SUCCESS_RECORD_INACTIVE,
+      ERROR_INACTIVE_RULE,
+    ],
+  },
+
+  loading: {
+    loadedPendingSeek: [
+      {
+        action: 'SEEK_TO_CLIP',
+        guard: seekToClipHitGuard,
+        patch: seekToClipHitPatch,
+      },
+      {
+        action: 'LOAD_SUCCESS',
+        guard: loadSuccessAdvancePendGuard,
+        patch: loadSuccessAdvancePatch,
+      },
+    ],
+    ready: [
+      {
+        action: 'LOAD_SUCCESS',
+        guard: loadSuccessAdvanceReadyGuard,
+        patch: loadSuccessAdvancePatch,
+      },
+    ],
+    error: [{action: 'ERROR', guard: activeGuard, patch: errorActivePatch}],
+    loading: [
+      SET_SEEKING_RULE,
+      PRELOAD_RULE,
+      {action: 'BUFFER', guard: activeGuard, patch: bufferPatch},
+      {action: 'SET_PLAYING', patch: setPlayingSelfPatch},
+      {action: 'SEEK_WITHIN_CLIP', patch: seekWithinPatch},
+      {
+        action: 'SEEK_TO_CLIP',
+        guard: seekToClipMissGuard,
+        patch: seekToClipMissPatch,
+      },
+      {action: 'RELOAD_ACTIVE', guard: reloadGuard, patch: reloadActivePatch},
+      LOAD_SUCCESS_RECORD_INACTIVE,
+      ERROR_INACTIVE_RULE,
+    ],
+  },
+
+  loadedPendingSeek: {
+    loading: [
+      {
+        action: 'SEEK_TO_CLIP',
+        guard: seekToClipMissGuard,
+        patch: seekToClipMissPatch,
+      },
+      {action: 'RELOAD_ACTIVE', guard: reloadGuard, patch: reloadActivePatch},
+    ],
+    seeking: [
+      {
+        action: 'SEEK_APPLIED',
+        guard: seekAppliedPlayGuard,
+        patch: seekAppliedPatch,
+      },
+    ],
+    ready: [
+      {
+        action: 'SEEK_APPLIED',
+        guard: seekAppliedPauseGuard,
+        patch: seekAppliedPatch,
+      },
+    ],
+    error: [{action: 'ERROR', guard: activeGuard, patch: errorActivePatch}],
+    loadedPendingSeek: [
+      SET_SEEKING_RULE,
+      PRELOAD_RULE,
+      {action: 'BUFFER', guard: activeGuard, patch: bufferPatch},
+      {action: 'SET_PLAYING', patch: setPlayingSelfPatch},
+      {action: 'SEEK_WITHIN_CLIP', patch: seekWithinPatch},
+      {
+        action: 'SEEK_TO_CLIP',
+        guard: seekToClipHitGuard,
+        patch: seekToClipHitPatch,
+      },
+      LOAD_SUCCESS_RECORD_ACTIVE,
+      LOAD_SUCCESS_RECORD_INACTIVE,
+      ERROR_INACTIVE_RULE,
+    ],
+  },
+
+  seeking: {
+    loadedPendingSeek: [
+      {action: 'SEEK_WITHIN_CLIP', patch: seekWithinPatch},
+      {
+        action: 'SEEK_TO_CLIP',
+        guard: seekToClipHitGuard,
+        patch: seekToClipHitPatch,
+      },
+      {action: 'END', guard: endHitSeekingGuard, patch: endHitPatch},
+    ],
+    loading: [
+      {
+        action: 'SEEK_TO_CLIP',
+        guard: seekToClipMissGuard,
+        patch: seekToClipMissPatch,
+      },
+      {action: 'RELOAD_ACTIVE', guard: reloadGuard, patch: reloadActivePatch},
+      {action: 'END', guard: endMissSeekingGuard, patch: endMissPatch},
+    ],
+    ready: [
+      {
+        action: 'SET_PLAYING',
+        guard: pauseGuard,
+        patch: setPlayingPauseSeekingPatch,
+      },
+      {action: 'PROGRESS', guard: progressGuard, patch: progressPatch},
+    ],
+    ended: [
+      {action: 'END', guard: endNoNextSeekingGuard, patch: endEndedPatch},
+    ],
+    error: [{action: 'ERROR', guard: activeGuard, patch: errorActivePatch}],
+    seeking: [
+      SET_SEEKING_RULE,
+      PRELOAD_RULE,
+      {action: 'BUFFER', guard: activeGuard, patch: bufferPatch},
+      {action: 'SET_PLAYING', guard: playGuard, patch: setPlayingSelfPatch},
+      LOAD_SUCCESS_RECORD_ACTIVE,
+      LOAD_SUCCESS_RECORD_INACTIVE,
+      ERROR_INACTIVE_RULE,
+    ],
+  },
+
+  ready: {
+    loading: [
+      {
+        action: 'SEEK_TO_CLIP',
+        guard: seekToClipMissGuard,
+        patch: seekToClipMissPatch,
+      },
+      {action: 'RELOAD_ACTIVE', guard: reloadGuard, patch: reloadActivePatch},
+      {action: 'END', guard: endMissGuard, patch: endMissPatch},
+    ],
+    loadedPendingSeek: [
+      {action: 'SEEK_WITHIN_CLIP', patch: seekWithinPatch},
+      {
+        action: 'SEEK_TO_CLIP',
+        guard: seekToClipHitGuard,
+        patch: seekToClipHitPatch,
+      },
+      {action: 'END', guard: endHitGuard, patch: endHitPatch},
+    ],
+    ended: [{action: 'END', guard: endNoNextGuard, patch: endEndedPatch}],
+    error: [{action: 'ERROR', guard: activeGuard, patch: errorActivePatch}],
+    ready: [
+      SET_SEEKING_RULE,
+      PRELOAD_RULE,
+      {action: 'BUFFER', guard: activeGuard, patch: bufferPatch},
+      {action: 'SET_PLAYING', patch: setPlayingSelfPatch},
+      LOAD_SUCCESS_RECORD_ACTIVE,
+      LOAD_SUCCESS_RECORD_INACTIVE,
+      {action: 'PROGRESS', guard: progressGuard, patch: progressPatch},
+      ERROR_INACTIVE_RULE,
+    ],
+  },
+
+  ended: {
+    loading: [
+      {
+        action: 'SEEK_TO_CLIP',
+        guard: seekToClipMissGuard,
+        patch: seekToClipMissPatch,
+      },
+      {action: 'RELOAD_ACTIVE', guard: reloadGuard, patch: reloadActivePatch},
+    ],
+    loadedPendingSeek: [
+      {action: 'SEEK_WITHIN_CLIP', patch: seekWithinPatch},
+      {
+        action: 'SEEK_TO_CLIP',
+        guard: seekToClipHitGuard,
+        patch: seekToClipHitPatch,
+      },
+    ],
+    error: [{action: 'ERROR', guard: activeGuard, patch: errorActivePatch}],
+    ended: [
+      SET_SEEKING_RULE,
+      PRELOAD_RULE,
+      {action: 'SET_PLAYING', guard: pauseGuard, patch: setPlayingSelfPatch},
+      LOAD_SUCCESS_RECORD_ACTIVE,
+      LOAD_SUCCESS_RECORD_INACTIVE,
+      ERROR_INACTIVE_RULE,
+    ],
+  },
+
+  error: {
+    loading: [
+      {
+        action: 'SEEK_TO_CLIP',
+        guard: seekToClipMissGuard,
+        patch: seekToClipMissPatch,
+      },
+      {action: 'RELOAD_ACTIVE', guard: reloadGuard, patch: reloadActivePatch},
+    ],
+    loadedPendingSeek: [
+      {
+        action: 'SEEK_TO_CLIP',
+        guard: seekToClipHitGuard,
+        patch: seekToClipHitPatch,
+      },
+    ],
+    error: [
+      SET_SEEKING_RULE,
+      PRELOAD_RULE,
+      {action: 'SET_PLAYING', guard: pauseGuard, patch: setPlayingSelfPatch},
+      LOAD_SUCCESS_RECORD_ACTIVE,
+      LOAD_SUCCESS_RECORD_INACTIVE,
+      {action: 'ERROR', guard: activeGuard, patch: errorActivePatch},
+      ERROR_INACTIVE_RULE,
+    ],
+  },
+};
+
+function initFromAction(action: AInit): State {
+  const {urlsLength} = action;
+  if (urlsLength <= 0) return initialState();
+
+  const first: SlotInfo = {
+    clipIdx: 0,
+    uri: action.firstUri,
+    loadKey: 1,
+  };
+
+  return {
+    ...initialState(),
+    urlsLength,
+    slots: [first, null],
+    slotLoadedKey: [null, null],
+    activeSlot: 0,
+    phase: action.firstUri ? 'loading' : 'idle',
+    isLoading: !!action.firstUri,
+    needsProgressClear: !!action.firstUri,
+    loadKeySeed: 1,
+    times: Array(urlsLength).fill(0),
+    isSeeking: false,
+  };
+}
+
+function reducer(state: State, action: Action): State {
+  if (action.type === 'INIT') {
+    return initFromAction(action as AInit);
+  }
+  const row = TRANSITIONS[state.phase];
+  if (!row) {
+    return state;
+  }
+  for (const to of PHASE_ORDER) {
+    const rules = row[to];
+    if (!rules) {
+      continue;
+    }
+    for (const r of rules) {
+      if (r.action !== action.type) {
+        continue;
+      }
+      if (r.guard && !r.guard(state, action)) {
+        continue;
+      }
+      return {...state, ...r.patch(state, action), phase: to};
+    }
+  }
+  return state;
 }
 
 export function useVideoSequencePlayer({
   urls,
   durations,
   recordDuration,
-  isSeeking,
   getClipForTime,
   onClipEnd,
 }: Params) {
@@ -811,7 +999,6 @@ export function useVideoSequencePlayer({
   const [state, dispatch] = useReducer(reducer, undefined, initialState);
   const stateRef = useLatestRef(state);
 
-  const isSeekingRef = useLatestRef(isSeeking);
   const playingRef = useLatestRef(state.wantPlaying);
   const currentTimeRef = useRef(0);
   const playedSecondsRef = useRef(0);
@@ -825,20 +1012,13 @@ export function useVideoSequencePlayer({
   }, [state.playedSeconds]);
 
   // We intentionally only re-init on `urls` changes.
-  // `isSeekingRef.current` is only used to snapshot the latest external seeking state.
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => {
     dispatch({
       type: 'INIT',
       urlsLength: urls.length,
       firstUri: urls[0] ?? '',
-      externalSeeking: isSeekingRef.current,
     });
   }, [urls]);
-
-  useEffect(() => {
-    dispatch({type: 'SET_EXTERNAL_SEEKING', isSeeking});
-  }, [isSeeking]);
 
   useEffect(() => {
     const s = stateRef.current;
@@ -846,9 +1026,11 @@ export function useVideoSequencePlayer({
     if (s.seekToken === s.appliedSeekToken) return;
 
     const player = playerRefs[s.activeSlot].current;
-    if (typeof player?.seek !== 'function') return;
-
-    player.seek(s.pendingSeekTime ?? s.currentTime);
+    if (typeof player?.seek === 'function') {
+      player.seek(s.pendingSeekTime ?? s.currentTime);
+    }
+    // Always dispatch SEEK_APPLIED to unblock the state machine and clear
+    // isSeeking — even if the player ref isn't ready (the seek is a no-op).
     dispatch({type: 'SEEK_APPLIED', seekToken: s.seekToken});
   }, [
     playerRefs,
@@ -900,6 +1082,10 @@ export function useVideoSequencePlayer({
     },
     [playingRef],
   );
+
+  const setIsSeeking = useCallback((v: boolean) => {
+    dispatch({type: 'SET_SEEKING', isSeeking: v});
+  }, []);
 
   const seekToClip = useCallback(
     (idx: number, localSeconds: number, opts?: SeekOptions) => {
@@ -1027,6 +1213,7 @@ export function useVideoSequencePlayer({
           ? () => {
               const s = stateRef.current;
               if (!isValidActiveEvent(s, slot, clipIdx, uri, loadKey)) return;
+              if (s.isSeeking) return;
               if (s.phase !== 'ready' && s.phase !== 'seeking') return;
               if (s.phase === 'seeking' && s.seekToken !== s.appliedSeekToken) {
                 return;
@@ -1081,6 +1268,8 @@ export function useVideoSequencePlayer({
     playing: state.wantPlaying,
     setPlaying,
     playingRef,
+    isSeeking: state.isSeeking,
+    setIsSeeking,
 
     sequenceEndCount: state.sequenceEndCount,
     playedSecondsRef,

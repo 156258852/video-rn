@@ -37,16 +37,19 @@ export function useAutoHideControls({
     }
   }, []);
 
-  const animate = useCallback((toVisible: boolean) => {
-    setVisible(toVisible);
+  const animate = useCallback(
+    (toVisible: boolean) => {
+      setVisible(toVisible);
 
-    opacity.stopAnimation();
-    Animated.timing(opacity, {
-      toValue: toVisible ? 1 : 0,
-      duration: 200,
-      useNativeDriver: true,
-    }).start();
-  }, []);
+      opacity.stopAnimation();
+      Animated.timing(opacity, {
+        toValue: toVisible ? 1 : 0,
+        duration: 200,
+        useNativeDriver: true,
+      }).start();
+    },
+    [opacity],
+  );
 
   const scheduleHide = useCallback(() => {
     cancelHideTimer();
@@ -79,7 +82,7 @@ export function useAutoHideControls({
     } else {
       show();
     }
-  }, [hide, show]);
+  }, [hide, show, visibleRef]);
 
   // Reset visibility whenever we (re)enter fullscreen, and clear timer on exit.
   useEffect(() => {
