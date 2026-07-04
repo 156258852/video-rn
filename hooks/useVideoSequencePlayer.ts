@@ -83,6 +83,10 @@ type State = {
   appliedSeekToken: number;
   pendingSeekTime: number | null;
 
+  // True between SEEK_APPLIED and the first PROGRESS — gates stale events
+  // from the pre-seek position during the native seek completion window.
+  seekJustApplied: boolean;
+
   playedSeconds: number;
 };
 
@@ -155,7 +159,7 @@ type AReload = Extract<Action, {type: 'RELOAD_ACTIVE'}>;
 type ALoadSuccess = Extract<Action, {type: 'LOAD_SUCCESS'}>;
 type AProgress = Extract<Action, {type: 'PROGRESS'}>;
 type AEnd = Extract<Action, {type: 'END'}>;
-type ABuferr = Extract<Action, {type: 'BUFFER'}>;
+type ABuffer = Extract<Action, {type: 'BUFFER'}>;
 type AError = Extract<Action, {type: 'ERROR'}>;
 // Any action carrying a {slot, clipIdx, uri, loadKey} identity payload.
 type EvtAction = Extract<Action, {slot: Slot; loadKey: number}>;
@@ -201,8 +205,8 @@ function appendResumeParam(uri: string, key: number) {
   return `${uri}${sep}_resume=${key}`;
 }
 
-function shouldPauseActive(state: State) {
-  switch (state.phase) {
+function shouldPauseActive(phase: Phase, wantPlaying: boolean) {
+  switch (phase) {
     case 'idle':
     case 'ended':
     case 'error':
@@ -213,7 +217,7 @@ function shouldPauseActive(state: State) {
     case 'loadedPendingSeek':
     case 'seeking':
     case 'ready':
-      return !state.wantPlaying;
+      return !wantPlaying;
     default:
       return true;
   }
@@ -240,6 +244,7 @@ function initialState(): State {
     seekToken: 0,
     appliedSeekToken: 0,
     pendingSeekTime: null,
+    seekJustApplied: false,
     playedSeconds: 0,
   };
 }
@@ -345,9 +350,11 @@ const progressGuard = (s: State, a: Action) => {
   const target = s.currentTime;
   const EPS = 0.5;
   if (target > EPS && t < target - EPS) return false;
-  // Also reject progress significantly AHEAD of current time — catches stale
-  // events after a backward seek where oldTime > newTime (currentTime).
-  if (t > target + MAX_PROGRESS_STEP) return false;
+  // Reject progress significantly AHEAD of current time — but only during
+  // the seek-settling window (between SEEK_APPLIED and first PROGRESS).
+  // This catches stale events after a backward seek without rejecting
+  // legitimate long jumps (e.g., after app background/resume).
+  if (s.seekJustApplied && t > target + MAX_PROGRESS_STEP) return false;
   return true;
 };
 const endHasNextGuard = (s: State, a: Action) => {
@@ -412,7 +419,7 @@ const preloadPatch = (s: State, a: Action): Partial<State> => {
   return {slots, slotLoadedKey, loadKeySeed: nextLoadKey};
 };
 const bufferPatch = (s: State, a: Action): Partial<State> => ({
-  isBuffering: (a as ABuferr).isBuffering,
+  isBuffering: (a as ABuffer).isBuffering,
 });
 const recordLoadedKeyPatch = (s: State, a: Action): Partial<State> => {
   const act = a as ALoadSuccess;
@@ -491,12 +498,20 @@ const seekAppliedPatch = (s: State, a: Action): Partial<State> => {
   // through SEEK_APPLIED. This prevents stale native events (old position)
   // from being accepted in the window between scrubber release and the
   // video player actually completing the seek.
+  //
+  // seekJustApplied stays true until the first PROGRESS clears it, gating
+  // stale END events and the progressGuard upper-bound check.
   if (s.wantPlaying) {
-    return {appliedSeekToken: act.seekToken, isSeeking: false};
+    return {
+      appliedSeekToken: act.seekToken,
+      isSeeking: false,
+      seekJustApplied: true,
+    };
   }
   return {
     appliedSeekToken: act.seekToken,
     isSeeking: false,
+    seekJustApplied: true,
     pendingSeekTime: null,
     isLoading: false,
     needsProgressClear: false,
@@ -560,6 +575,7 @@ const progressPatch = (s: State, a: Action): Partial<State> => {
     isLoading: s.needsProgressClear ? false : s.isLoading,
     needsProgressClear: false,
     pendingSeekTime: null,
+    seekJustApplied: false,
   };
 };
 const endTailPlayed = (s: State, a: Action) => {
@@ -916,6 +932,7 @@ const TRANSITIONS: Matrix = {
       {action: 'RELOAD_ACTIVE', guard: reloadGuard, patch: reloadActivePatch},
     ],
     loadedPendingSeek: [
+      {action: 'SEEK_WITHIN_CLIP', patch: seekWithinPatch},
       {
         action: 'SEEK_TO_CLIP',
         guard: seekToClipHitGuard,
@@ -1026,11 +1043,14 @@ export function useVideoSequencePlayer({
     if (s.seekToken === s.appliedSeekToken) return;
 
     const player = playerRefs[s.activeSlot].current;
-    if (typeof player?.seek === 'function') {
-      player.seek(s.pendingSeekTime ?? s.currentTime);
+    try {
+      if (typeof player?.seek === 'function') {
+        player.seek(s.pendingSeekTime ?? s.currentTime);
+      }
+    } catch {
+      // Ignore seek errors — dispatch SEEK_APPLIED to unblock the state
+      // machine regardless (the seek is treated as a no-op).
     }
-    // Always dispatch SEEK_APPLIED to unblock the state machine and clear
-    // isSeeking — even if the player ref isn't ready (the seek is a no-op).
     dispatch({type: 'SEEK_APPLIED', seekToken: s.seekToken});
   }, [
     playerRefs,
@@ -1181,7 +1201,7 @@ export function useVideoSequencePlayer({
         ref: playerRefs[slot],
         source: {uri, bufferConfig: BUFFER_CONFIG},
         // Keep active slot unpaused while loading to avoid implementations that don't emit load callbacks when paused.
-        paused: !isActive || shouldPauseActive(state),
+        paused: !isActive || shouldPauseActive(state.phase, state.wantPlaying),
         onLoad: (e: any) => {
           const d = Number(e?.duration);
           if (recordDuration && Number.isFinite(d)) recordDuration(clipIdx, d);
@@ -1217,6 +1237,16 @@ export function useVideoSequencePlayer({
               if (s.phase !== 'ready' && s.phase !== 'seeking') return;
               if (s.phase === 'seeking' && s.seekToken !== s.appliedSeekToken) {
                 return;
+              }
+
+              // Reject stale END events after a seek: if the seek was just
+              // applied (no PROGRESS yet to confirm native seek completed)
+              // and currentTime is not near the clip end, the END is stale.
+              if (s.seekJustApplied) {
+                const cd = Number(durations[clipIdx] ?? 0);
+                const nearEnd =
+                  !Number.isFinite(cd) || cd <= 0 || s.currentTime >= cd - 1.5;
+                if (!nearEnd) return;
               }
 
               const clipDuration = Number(durations[clipIdx] ?? 0);
@@ -1260,7 +1290,18 @@ export function useVideoSequencePlayer({
         },
       };
     });
-  }, [durations, onClipEnd, playerRefs, recordDuration, state, stateRef, urls]);
+  }, [
+    durations,
+    onClipEnd,
+    playerRefs,
+    recordDuration,
+    state.activeSlot,
+    state.phase,
+    state.slots,
+    state.wantPlaying,
+    stateRef,
+    urls,
+  ]);
 
   return {
     videoSlots,
