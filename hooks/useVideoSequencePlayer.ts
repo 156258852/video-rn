@@ -169,7 +169,9 @@ function otherSlot(s: Slot): Slot {
 }
 
 function ensureTimesLen(prev: number[], len: number): number[] {
-  if (prev.length === len) return prev;
+  if (prev.length === len) {
+    return prev;
+  }
   return Array(len).fill(0);
 }
 
@@ -196,7 +198,9 @@ function isValidActiveEvent(
   uri: string,
   loadKey: number,
 ) {
-  if (slot !== state.activeSlot) return false;
+  if (slot !== state.activeSlot) {
+    return false;
+  }
   return isValidAssignedEvent(state, slot, clipIdx, uri, loadKey);
 }
 
@@ -341,20 +345,32 @@ const loadSuccessAdvancePendGuard = (s: State, a: Action) =>
 const loadSuccessAdvanceReadyGuard = (s: State, a: Action) =>
   loadSuccessActiveGuard(s, a) && noPending(s);
 const progressGuard = (s: State, a: Action) => {
-  if (!activeGuard(s, a)) return false;
-  if (s.isSeeking) return false;
-  if (s.seekToken !== s.appliedSeekToken) return false;
+  if (!activeGuard(s, a)) {
+    return false;
+  }
+  if (s.isSeeking) {
+    return false;
+  }
+  if (s.seekToken !== s.appliedSeekToken) {
+    return false;
+  }
   const act = a as AProgress;
-  if (s.currentIndex !== act.clipIdx) return false;
+  if (s.currentIndex !== act.clipIdx) {
+    return false;
+  }
   const t = act.time;
   const target = s.currentTime;
   const EPS = 0.5;
-  if (target > EPS && t < target - EPS) return false;
+  if (target > EPS && t < target - EPS) {
+    return false;
+  }
   // Reject progress significantly AHEAD of current time — but only during
   // the seek-settling window (between SEEK_APPLIED and first PROGRESS).
   // This catches stale events after a backward seek without rejecting
   // legitimate long jumps (e.g., after app background/resume).
-  if (s.seekJustApplied && t > target + MAX_PROGRESS_STEP) return false;
+  if (s.seekJustApplied && t > target + MAX_PROGRESS_STEP) {
+    return false;
+  }
   return true;
 };
 const endHasNextGuard = (s: State, a: Action) => {
@@ -953,7 +969,9 @@ const TRANSITIONS: Matrix = {
 
 function initFromAction(action: AInit): State {
   const {urlsLength} = action;
-  if (urlsLength <= 0) return initialState();
+  if (urlsLength <= 0) {
+    return initialState();
+  }
 
   const first: SlotInfo = {
     clipIdx: 0,
@@ -984,22 +1002,36 @@ function reducer(state: State, action: Action): State {
   if (!row) {
     return state;
   }
-  for (const to of PHASE_ORDER) {
-    const rules = row[to];
-    if (!rules) {
-      continue;
-    }
-    for (const r of rules) {
-      if (r.action !== action.type) {
-        continue;
+  const matched = PHASE_ORDER.reduce<{to: Phase; rule: Rule} | null>(
+    (acc, to) => {
+      if (acc) {
+        return acc;
       }
-      if (r.guard && !r.guard(state, action)) {
-        continue;
-      }
-      return {...state, ...r.patch(state, action), phase: to};
-    }
+
+      const rule = row[to]?.find(r => {
+        if (r.action !== action.type) {
+          return false;
+        }
+        if (r.guard && !r.guard(state, action)) {
+          return false;
+        }
+        return true;
+      });
+
+      return rule ? {to, rule} : null;
+    },
+    null,
+  );
+
+  if (!matched) {
+    return state;
   }
-  return state;
+
+  return {
+    ...state,
+    ...matched.rule.patch(state, action),
+    phase: matched.to,
+  };
 }
 
 export function useVideoSequencePlayer({
@@ -1039,8 +1071,12 @@ export function useVideoSequencePlayer({
 
   useEffect(() => {
     const s = stateRef.current;
-    if (s.phase !== 'loadedPendingSeek') return;
-    if (s.seekToken === s.appliedSeekToken) return;
+    if (s.phase !== 'loadedPendingSeek') {
+      return;
+    }
+    if (s.seekToken === s.appliedSeekToken) {
+      return;
+    }
 
     const player = playerRefs[s.activeSlot].current;
     try {
@@ -1064,20 +1100,29 @@ export function useVideoSequencePlayer({
   ]);
 
   useEffect(() => {
-    if (urls.length === 0) return;
-    if (state.phase !== 'ready') return;
+    if (urls.length === 0) {
+      return;
+    }
+    if (state.phase !== 'ready') {
+      return;
+    }
 
     const nextIdx = Math.min(state.currentIndex + 1, urls.length - 1);
-    if (nextIdx === state.currentIndex) return;
+    if (nextIdx === state.currentIndex) {
+      return;
+    }
 
     const slot = otherSlot(state.activeSlot);
     const uri = urls[nextIdx] ?? '';
-    if (!uri) return;
+    if (!uri) {
+      return;
+    }
 
     // Avoid repeating preload dispatches while already ready.
     const existing = state.slots[slot];
-    if (existing && existing.clipIdx === nextIdx && existing.uri === uri)
+    if (existing && existing.clipIdx === nextIdx && existing.uri === uri) {
       return;
+    }
 
     dispatch({type: 'PRELOAD_SLOT', slot, clipIdx: nextIdx, uri});
   }, [state.activeSlot, state.currentIndex, state.phase, state.slots, urls]);
@@ -1109,14 +1154,18 @@ export function useVideoSequencePlayer({
 
   const seekToClip = useCallback(
     (idx: number, localSeconds: number, opts?: SeekOptions) => {
-      if (urls.length === 0) return;
+      if (urls.length === 0) {
+        return;
+      }
 
       const play = opts?.play ?? true;
       const nextIdx = Math.max(0, Math.min(urls.length - 1, idx));
 
       let t = Math.max(0, Number(localSeconds) || 0);
       const dur = durations[nextIdx] ?? 0;
-      if (Number.isFinite(dur) && dur > 0 && t > dur) t = dur;
+      if (Number.isFinite(dur) && dur > 0 && t > dur) {
+        t = dur;
+      }
 
       const s = stateRef.current;
       if (nextIdx === s.currentIndex) {
@@ -1125,7 +1174,9 @@ export function useVideoSequencePlayer({
       }
 
       const uri = urls[nextIdx] ?? '';
-      if (!uri) return;
+      if (!uri) {
+        return;
+      }
 
       dispatch({
         type: 'SEEK_TO_CLIP',
@@ -1140,7 +1191,9 @@ export function useVideoSequencePlayer({
 
   const seekVirtual = useCallback(
     (t: number, opts?: SeekOptions) => {
-      if (!getClipForTime) return;
+      if (!getClipForTime) {
+        return;
+      }
       const r = getClipForTime(t);
       seekToClip(r.idx, r.local, opts);
     },
@@ -1204,7 +1257,9 @@ export function useVideoSequencePlayer({
         paused: !isActive || shouldPauseActive(state.phase, state.wantPlaying),
         onLoad: (e: any) => {
           const d = Number(e?.duration);
-          if (recordDuration && Number.isFinite(d)) recordDuration(clipIdx, d);
+          if (recordDuration && Number.isFinite(d)) {
+            recordDuration(clipIdx, d);
+          }
 
           dispatch({
             type: 'LOAD_SUCCESS',
@@ -1217,7 +1272,9 @@ export function useVideoSequencePlayer({
         onProgress: isActive
           ? (e: any) => {
               const t = Number(e?.currentTime ?? 0);
-              if (!Number.isFinite(t)) return;
+              if (!Number.isFinite(t)) {
+                return;
+              }
 
               dispatch({
                 type: 'PROGRESS',
@@ -1232,9 +1289,15 @@ export function useVideoSequencePlayer({
         onEnd: isActive
           ? () => {
               const s = stateRef.current;
-              if (!isValidActiveEvent(s, slot, clipIdx, uri, loadKey)) return;
-              if (s.isSeeking) return;
-              if (s.phase !== 'ready' && s.phase !== 'seeking') return;
+              if (!isValidActiveEvent(s, slot, clipIdx, uri, loadKey)) {
+                return;
+              }
+              if (s.isSeeking) {
+                return;
+              }
+              if (s.phase !== 'ready' && s.phase !== 'seeking') {
+                return;
+              }
               if (s.phase === 'seeking' && s.seekToken !== s.appliedSeekToken) {
                 return;
               }
@@ -1246,7 +1309,9 @@ export function useVideoSequencePlayer({
                 const cd = Number(durations[clipIdx] ?? 0);
                 const nearEnd =
                   !Number.isFinite(cd) || cd <= 0 || s.currentTime >= cd - 1.5;
-                if (!nearEnd) return;
+                if (!nearEnd) {
+                  return;
+                }
               }
 
               const clipDuration = Number(durations[clipIdx] ?? 0);

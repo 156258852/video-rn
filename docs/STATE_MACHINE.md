@@ -2,23 +2,79 @@
 
 本文档描述 `hooks/useVideoSequencePlayer.ts` 中的有限状态机（FSM）设计。
 
+在阅读前，先明确一个核心点：本状态机包含两个**正交维度**。
+
+1. **Playback Phase**：`idle / loading / loadedPendingSeek / seeking / ready / ended / error`
+2. **User Gesture State**：`isSeeking`
+
+也就是说：`phase === 'seeking'` **不等于** `isSeeking === true`。
+
+- `phase === 'seeking'` 表示 seek 已 **applied**，正在等待首个有效 `PROGRESS` 做确认
+- `isSeeking === true` 表示用户当前正在拖动 scrubber，这只是一个手势态，用于 gate `PROGRESS / END`
+
 ---
 
 ## 1. 七个阶段（Phase）
 
-| Phase               | 含义                                                  | 是否接受 PROGRESS | 是否接受 END           |
-| ------------------- | ----------------------------------------------------- | ----------------- | ---------------------- |
-| `idle`              | 无 clip 加载（urls 为空或首次 INIT 前）               | ✗                 | ✗                      |
-| `loading`           | active slot 正在加载 clip，等待 `onLoad`              | ✗                 | ✗                      |
-| `loadedPendingSeek` | clip 已加载，有 pending seek 等待执行                 | ✗                 | ✗                      |
-| `seeking`           | seek 已提交（`SEEK_APPLIED`），等待首个 PROGRESS 确认 | ✓                 | ✓（需 seek 已 settle） |
-| `ready`             | 正常播放中，PROGRESS / END 正常处理                   | ✓                 | ✓                      |
-| `ended`             | 最后一段播放完毕，等待用户 seek 恢复                  | ✗                 | ✗                      |
-| `error`             | active slot 发生错误，等待用户 seek 恢复              | ✗                 | ✗                      |
+| Phase               | 含义                                                      | 是否接受 PROGRESS | 是否接受 END                                                           |
+| ------------------- | --------------------------------------------------------- | ----------------- | ---------------------------------------------------------------------- |
+| `idle`              | 无 clip 加载（urls 为空或首次 INIT 前）                   | ✗                 | ✗                                                                      |
+| `loading`           | active slot 正在加载 clip，等待 `onLoad`                  | ✗                 | ✗                                                                      |
+| `loadedPendingSeek` | clip 已加载，有 pending seek 等待执行                     | ✗                 | ✗                                                                      |
+| `seeking`           | seek 已 applied（`SEEK_APPLIED`），等待首个 PROGRESS 确认 | ✓                 | ✓（需 seek 已 applied；首个 PROGRESS 前额外受 `seekJustApplied` 保护） |
+| `ready`             | 正常播放中，PROGRESS / END 正常处理                       | ✓                 | ✓                                                                      |
+| `ended`             | 最后一段播放完毕，等待用户 seek / reload 恢复             | ✗                 | ✗                                                                      |
+| `error`             | active slot 发生错误，等待用户 seek / reload 恢复         | ✗                 | ✗                                                                      |
 
 ---
 
-## 2. 2D 转移矩阵结构
+## 2. 总状态图（鸟瞰）
+
+```text
+                    INIT(urls[0])
+               +--------------------+
+               |                    v
+             idle -- SEEK_TO_CLIP(hit) ------------------------------> loadedPendingSeek
+               |                                                      |
+               | SEEK_TO_CLIP(miss) / RELOAD_ACTIVE                   | SEEK_APPLIED
+               v                                                      v
+            loading -- LOAD_SUCCESS(hasPending) --> loadedPendingSeek --> seeking -- PROGRESS --> ready
+               |                                         ^                 |                     |
+               | LOAD_SUCCESS(noPending)                 |                 | SET_PLAYING(false)  |
+               v                                         |                 v                     |
+             ready -- SEEK_WITHIN_CLIP / SEEK_TO_CLIP(hit) --------------> loadedPendingSeek    |
+               | -- SEEK_TO_CLIP(miss) / RELOAD_ACTIVE -----------------> loading               |
+               | -- END(next, hit) -------------------------------------> loadedPendingSeek      |
+               | -- END(next, miss) ------------------------------------> loading               |
+               | -- END(last) ------------------------------------------> ended                 |
+               | -- ERROR(active) --------------------------------------> error                 |
+               |
+            seeking -- END(next, hit) ---------------------------------> loadedPendingSeek
+               | -- END(next, miss) -----------------------------------> loading
+               | -- END(last) -----------------------------------------> ended
+               | -- ERROR(active) -------------------------------------> error
+
+            ended -- SEEK_WITHIN_CLIP / SEEK_TO_CLIP(hit) -----------> loadedPendingSeek
+               | -- SEEK_TO_CLIP(miss) / RELOAD_ACTIVE -------------> loading
+
+            error -- SEEK_WITHIN_CLIP / SEEK_TO_CLIP(hit) -----------> loadedPendingSeek
+               | -- SEEK_TO_CLIP(miss) / RELOAD_ACTIVE -------------> loading
+```
+
+### 如何读这张图
+
+- 这张图只展示**主干路径**，省略了 self-transition（如 `SET_SEEKING`、`PRELOAD_SLOT`、部分 `LOAD_SUCCESS/ERROR` 记录型规则）
+- `loadedPendingSeek → seeking/ready` 取决于 `SEEK_APPLIED` 时的 `wantPlaying`
+- `seeking → ready` 的语义是：seek 已 **confirmed**（首个有效 `PROGRESS` 到达）
+- `idle` / `ended` / `error` 都可能通过 `SEEK_TO_CLIP(hit)` 直接进入 `loadedPendingSeek`；只有 miss seek 或 `RELOAD_ACTIVE` 才进入 `loading`
+- 其中 `idle -> SEEK_TO_CLIP(hit) -> loadedPendingSeek` 属于**特殊但合法**的恢复路径，并不是常规 INIT 主路径；常规首次进入播放通常仍是 `INIT -> loading`
+- `ended` / `error` 都不能通过 `SET_PLAYING(true)` 直接恢复；必须经由 seek 或 reload 离开
+- `END` 从 `ready` 和 `seeking` 都可能发生；有下一段时，preload hit → `loadedPendingSeek`，preload miss → `loading`
+- 在 `seeking` 中处理 `END` 时，只要求 seek 已 **applied**，并额外受 `seekJustApplied` 保护
+
+---
+
+## 3. 2D 转移矩阵结构
 
 ### 核心数据结构
 
@@ -37,32 +93,50 @@ type Matrix = Record<Phase, Partial<Record<Phase, Rule[]>>>;
 
 ```ts
 function reducer(state: State, action: Action): State {
-  if (action.type === 'INIT') return initFromAction(action);
-  const row = TRANSITIONS[state.phase];
-  for (const to of PHASE_ORDER) {
-    // 遍历目标 phase
-    const rules = row[to];
-    if (!rules) continue;
-    for (const r of rules) {
-      // 遍历规则
-      if (r.action !== action.type) continue;
-      if (r.guard && !r.guard(state, action)) continue;
-      return {...state, ...r.patch(state, action), phase: to};
-    }
+  if (action.type === 'INIT') {
+    return initFromAction(action as AInit);
   }
-  return state; // 无匹配规则 → 丢弃 action
+  const row = TRANSITIONS[state.phase];
+  if (!row) {
+    return state;
+  }
+  const matched = PHASE_ORDER.reduce<{to: Phase; rule: Rule} | null>(
+    (acc, to) => {
+      if (acc) return acc;
+
+      const rule = row[to]?.find(r => {
+        if (r.action !== action.type) return false;
+        if (r.guard && !r.guard(state, action)) return false;
+        return true;
+      });
+
+      return rule ? {to, rule} : null;
+    },
+    null,
+  );
+
+  if (!matched) {
+    return state;
+  }
+
+  return {
+    ...state,
+    ...matched.rule.patch(state, action),
+    phase: matched.to,
+  };
 }
 ```
 
 **关键特性：**
 
-- 第一个匹配（action + guard）的规则立即返回，后续规则不再检查
+- reducer 按 `PHASE_ORDER` 顺序扫描目标 phase，并在每个 cell 内查找第一个匹配（action + guard）的规则
+- 一旦找到首个匹配规则，就停止搜索；后续 phase / 规则不再检查
 - 对角线单元格（`to === from`）持有"仅副作用"规则，不改变 phase
-- 空单元格 = 非法转移，action 被静默丢弃
+- 空单元格或 guard 全部不通过 = 非法/不适用转移，action 被静默丢弃
 
 ---
 
-## 3. 关键状态字段
+## 4. 关键状态字段
 
 ### Seek 生命周期字段
 
@@ -85,6 +159,16 @@ function reducer(state: State, action: Action): State {
                       appliedSeekToken=token
 ```
 
+### applied vs confirmed
+
+- **seek 已 applied**：`seekToken === appliedSeekToken`，表示 seek 已经提交给 native player
+- **seek 已 confirmed**：首个符合 `progressGuard` 的 `PROGRESS` 已到达；此时 `seekJustApplied` 会被清除，`seeking → ready`
+
+文档后文中：
+
+- 若写“已 applied”，指 token 已对齐
+- 若写“已 confirmed / 已完成确认”，指首个有效 `PROGRESS` 已到达
+
 ### 三层 stale event 防御
 
 | 层                               | 生效区间                       | 防御对象                              | 机制                                            |
@@ -95,9 +179,9 @@ function reducer(state: State, action: Action): State {
 
 ---
 
-## 4. 各 Phase 的转移规则
+## 5. 各 Phase 的转移规则
 
-### 4.1 `idle`
+### 5.1 `idle`
 
 | 目标                | Action          | Guard           | 说明                           |
 | ------------------- | --------------- | --------------- | ------------------------------ |
@@ -113,7 +197,7 @@ function reducer(state: State, action: Action): State {
 
 **设计意图：** idle 表示没有 clip 可播。唯一离开 idle 的方式是 seek 或 reload。
 
-### 4.2 `loading`
+### 5.2 `loading`
 
 | 目标                | Action             | Guard             | 说明                                   |
 | ------------------- | ------------------ | ----------------- | -------------------------------------- |
@@ -131,7 +215,9 @@ function reducer(state: State, action: Action): State {
 | `loading` (self)    | `LOAD_SUCCESS`     | inactiveGuard     | 记录 inactive slot 加载完成            |
 | `loading` (self)    | `ERROR`            | inactiveGuard     | inactive slot 出错 → 丢弃              |
 
-### 4.3 `loadedPendingSeek`
+**设计意图：** `loading` 阶段会让 active slot 保持 **unpaused**。这是一个兼容性选择：某些视频实现如果组件处于 paused 状态，可能不会稳定触发 `onLoad`。因此本 hook 在 `loading` 时不依赖 `wantPlaying` 来 pause active slot，而是优先保证 load 回调能到达。
+
+### 5.3 `loadedPendingSeek`
 
 | 目标                       | Action             | Guard           | 说明                       |
 | -------------------------- | ------------------ | --------------- | -------------------------- |
@@ -149,9 +235,9 @@ function reducer(state: State, action: Action): State {
 | `loadedPendingSeek` (self) | `LOAD_SUCCESS`     | active/inactive | —                          |
 | `loadedPendingSeek` (self) | `ERROR`            | inactiveGuard   | —                          |
 
-**设计意图：** 此 phase 的唯一出口是 `SEEK_APPLIED`（由 seek effect 在 `player.seek()` 后 dispatch）。seek effect 只在 `phase === 'loadedPendingSeek'` 时触发。
+**设计意图：** 此 phase 的正常推进出口是 `SEEK_APPLIED`（由 seek effect 在 `player.seek()` 后 dispatch）。但如果用户再次 seek 到未预加载 clip、触发 `RELOAD_ACTIVE`，或 active slot 发生错误，也可能分别转到 `loading` 或 `error`。seek effect 只在 `phase === 'loadedPendingSeek'` 时触发。
 
-### 4.4 `seeking`
+### 5.4 `seeking`
 
 | 目标                | Action             | Guard                 | 说明                            |
 | ------------------- | ------------------ | --------------------- | ------------------------------- |
@@ -172,9 +258,9 @@ function reducer(state: State, action: Action): State {
 | `seeking` (self)    | `LOAD_SUCCESS`     | active/inactive       | —                               |
 | `seeking` (self)    | `ERROR`            | inactiveGuard         | —                               |
 
-**设计意图：** seeking 是 seek 完成后的"确认等待"阶段。首个 PROGRESS 将状态带到 `ready`。在 seeking 中再次 seek 会回到 `loadedPendingSeek`。
+**设计意图：** seeking 是 seek **已 applied 但尚未 confirmed** 的“确认等待”阶段。此时 `seekToken === appliedSeekToken` 已成立，但 `seekJustApplied` 仍为 `true`，直到首个有效 `PROGRESS` 到达才会清除，并将状态带到 `ready`。因此 `seeking` 中的 `END` 并不要求“首个 PROGRESS 已到达”，只要求 seek 已 applied；额外的 stale END 防御由 `seekJustApplied` + nearEnd 检查承担。在 seeking 中再次 seek 会回到 `loadedPendingSeek`。
 
-### 4.5 `ready`
+### 5.5 `ready`
 
 | 目标                | Action             | Guard           | 说明                            |
 | ------------------- | ------------------ | --------------- | ------------------------------- |
@@ -194,7 +280,7 @@ function reducer(state: State, action: Action): State {
 | `ready` (self)      | `PROGRESS`         | progressGuard   | 正常进度更新                    |
 | `ready` (self)      | `ERROR`            | inactiveGuard   | —                               |
 
-### 4.6 `ended`
+### 5.6 `ended`
 
 | 目标                | Action             | Guard           | 说明                |
 | ------------------- | ------------------ | --------------- | ------------------- |
@@ -209,9 +295,9 @@ function reducer(state: State, action: Action): State {
 | `ended` (self)      | `LOAD_SUCCESS`     | active/inactive | —                   |
 | `ended` (self)      | `ERROR`            | inactiveGuard   | —                   |
 
-**设计意图：** ended 不接受 `SET_PLAYING true` — 用户必须 seek 才能恢复播放。
+**设计意图：** ended 不接受 `SET_PLAYING true` — 用户必须通过 seek 或 `RELOAD_ACTIVE` 才能恢复播放。
 
-### 4.7 `error`
+### 5.7 `error`
 
 | 目标                | Action             | Guard           | 说明                      |
 | ------------------- | ------------------ | --------------- | ------------------------- |
@@ -226,13 +312,13 @@ function reducer(state: State, action: Action): State {
 | `error` (self)      | `ERROR`            | activeGuard     | 更新 active slot 错误信息 |
 | `error` (self)      | `ERROR`            | inactiveGuard   | inactive slot 出错 → 丢弃 |
 
-**设计意图：** error 不接受 `SET_PLAYING true` — 用户必须 seek（`SEEK_WITHIN_CLIP` / `SEEK_TO_CLIP` / `RELOAD_ACTIVE`）才能恢复。
+**设计意图：** error 不接受 `SET_PLAYING true` — 用户必须通过 seek 或 `RELOAD_ACTIVE` 才能恢复。
 
 ---
 
-## 5. Seek 完整流程
+## 6. Seek 完整流程
 
-### 5.1 段内 seek（SEEK_WITHIN_CLIP）
+### 6.1 段内 seek（SEEK_WITHIN_CLIP）
 
 ```
 用户拖动 scrubber
@@ -270,7 +356,7 @@ seek effect 触发
 正常播放
 ```
 
-### 5.2 跨 clip seek（SEEK_TO_CLIP）
+### 6.2 跨 clip seek（SEEK_TO_CLIP）
 
 **Hit（目标已预加载）：**
 
@@ -301,7 +387,7 @@ LOAD_SUCCESS → loadedPendingSeek → seek effect → SEEK_APPLIED → seeking 
 
 ---
 
-## 6. Clip 切换流程（onEnd）
+## 7. Clip 切换流程（onEnd）
 
 ```
 onEnd 触发
@@ -310,7 +396,7 @@ onEnd 触发
     │    ✓ isValidActiveEvent (slot, clipIdx, uri, loadKey 匹配)
     │    ✓ !isSeeking
     │    ✓ phase === 'ready' 或 'seeking'
-    │    ✓ 若 seeking: seekToken === appliedSeekToken (seek 已 settle)
+    │    ✓ 若 seeking: seekToken === appliedSeekToken (seek 已 applied，token 已对齐)
     │    ✓ 若 seekJustApplied: currentTime >= clipDuration - 1.5 (nearEnd 检查)
     │
     ▼
@@ -335,9 +421,11 @@ dispatch END
 （非 ended 分支）seek effect → SEEK_APPLIED → seeking → PROGRESS → ready
 ```
 
+补充说明：在 `seeking` 中收到 `END` 是允许的。典型场景是用户 seek 到片尾附近，native player 在首个 `PROGRESS` 到达前就直接发出 `END`。此时 reducer 只要求 seek 已 applied；是否接受该 `END`，由 `seekJustApplied` 窗口中的 nearEnd 检查进一步决定。
+
 ---
 
-## 7. 错误处理策略
+## 8. 错误处理策略
 
 ### Active slot 错误
 
@@ -367,7 +455,7 @@ ERROR (inactive) → errorInactivePatch → phase 不变（self-cell）
 
 ---
 
-## 8. `seekJustApplied` 机制详解
+## 9. `seekJustApplied` 机制详解
 
 ### 生命周期
 
@@ -409,7 +497,52 @@ ERROR (inactive) → errorInactivePatch → phase 不变（self-cell）
 
 ---
 
-## 9. 双播放器预加载系统
+## 10. 调试与观测建议
+
+### 建议记录的最小调试字段
+
+排查时建议至少记录：
+
+- `phase`
+- `activeSlot`
+- `currentIndex`
+- `currentTime`
+- `isSeeking`
+- `seekToken`
+- `appliedSeekToken`
+- `seekJustApplied`
+- `isLoading`
+- `isBuffering`
+- `slots[0] / slots[1]` 中的 `{ clipIdx, uri, loadKey }`
+
+### 如何判断事件是不是 stale
+
+`LOAD_SUCCESS / PROGRESS / END / BUFFER / ERROR` 都携带事件身份：
+
+- `slot`
+- `clipIdx`
+- `uri`
+- `loadKey`
+
+判断原则：
+
+1. 先看事件是否仍然属于 `state.slots[slot]`
+2. 再看该 `slot` 是否仍是 `activeSlot`
+3. 对 `PROGRESS / END` 再叠加 seek 相关 gate：`isSeeking`、`seekToken === appliedSeekToken`、`seekJustApplied`
+
+如果某个事件的 `{ slot, clipIdx, uri, loadKey }` 与当前 `state.slots[slot]` 不一致，它就是旧 clip / 旧 load 实例发出的 stale event，应被 reducer 或 handler 丢弃。
+
+### 常见排查路径
+
+- **一直停在 `loading`**：先看 active slot 是否真的发出了 `LOAD_SUCCESS`
+- **一直停在 `loadedPendingSeek`**：看 seek effect 是否执行，以及是否 dispatch 了 `SEEK_APPLIED`
+- **一直停在 `seeking`**：看首个 `PROGRESS` 是否被 `progressGuard` 拒绝
+- **刚 seek 后误触发 `END`**：重点看 `seekJustApplied`、`currentTime` 与 `clipDuration` 的 nearEnd 条件
+- **预加载命中失败**：重点看 inactive slot 的 `clipIdx / uri / loadKey` 是否和目标 clip 完全一致，以及 `slotLoadedKey[inactive]` 是否等于 preload 的 `loadKey`
+
+---
+
+## 11. 双播放器预加载系统
 
 ### Slot 轮转
 
@@ -427,24 +560,3 @@ activeSlot = 0 (播放 clip 0)     inactiveSlot = 1 (预加载 clip 1)
          ▼
 activeSlot = 1 (播放 clip 1)     inactiveSlot = 0 (预加载 clip 2)
 ```
-
-### videoSlots memo 优化
-
-`videoSlots` memo 的依赖项经过优化，仅包含构造 Video props 所需的最小 state 子集：
-
-```ts
-}, [
-  durations,           // onEnd 中读取 clipDuration
-  onClipEnd,           // onEnd 中回调
-  playerRefs,          // ref 属性
-  recordDuration,      // onLoad 中回调
-  state.activeSlot,    // isActive 判断
-  state.phase,         // shouldPauseActive 判断
-  state.slots,         // slot info（source uri 等）
-  state.wantPlaying,   // shouldPauseActive 判断
-  stateRef,            // onEnd 中读取最新 state
-  urls,                // onEnd 中读取 nextUri
-]);
-```
-
-**关键优化：** PROGRESS 事件改变 `currentTime`、`times`、`playedSeconds`、`isLoading`、`needsProgressClear`、`pendingSeekTime`、`seekJustApplied` — 这些都不在 memo 依赖中。因此 PROGRESS 不会触发 `videoSlots` 重算，避免两个 `<Video>` 组件不必要地重渲染。所有事件处理器通过 `stateRef.current` 在事件发生时读取最新状态。
