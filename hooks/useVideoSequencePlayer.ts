@@ -5,8 +5,8 @@ import React, {
   useReducer,
   useRef,
 } from 'react';
+import {useLatestRef} from '../utils';
 
-// ======================= 类型定义 =======================
 type SeekRequest = {idx: number; time: number};
 type ClipForTime = {idx: number; local: number};
 
@@ -21,555 +21,774 @@ export type VideoSlotProps = {
   onError?: (e: any) => void;
 };
 
+type ClipEndPayload = {idx: number; uri: string; duration: number};
+
 type Params = {
   urls: string[];
   durations: number[];
   recordDuration?: (idx: number, durationSeconds: number) => void;
+  isSeeking: boolean;
   getClipForTime?: (t: number) => ClipForTime;
-  /** 播放完成所需观看比例 (默认 0.98) */
-  completionRatio?: number;
+  onClipEnd?: (payload: ClipEndPayload) => void;
 };
 
 type SeekOptions = {play?: boolean};
 
-// ======================= 常量 =======================
 const BUFFER_CONFIG = {cacheSizeMB: 200};
 const MAX_PROGRESS_STEP = 1.5;
 
-// ======================= 状态机类型 =======================
+type Slot = 0 | 1;
+type Phase =
+  | 'idle'
+  | 'loading'
+  | 'loadedPendingSeek'
+  | 'seeking'
+  | 'ready'
+  | 'ended'
+  | 'error';
 
-/**
- * 播放器生命周期阶段（互斥）
- *
- * Idle → Loading ─→ Playing ───→ Completed
- *               ↓   ↕        ↗
- *             Error  Paused
- *                    ↕
- *               Buffering
- *                    ↓
- *               Error
- *
- * Loading: 等待首帧 onProgress（或 PLAY 可跳过直接进入 Playing）
- * 注意：同 clip seek 不会改变 phase，仅更新 times/version。
- *       跨 clip seek 只有当目标 clip 尚未加载到目标 slot 时才会进入 Loading。
- */
-type PlayerPhase =
-  | 'Idle'
-  | 'Loading' // Waiting for first onProgress or user press PLAY
-  | 'Playing' // Actively playing (progress flowing)
-  | 'Paused' // User paused
-  | 'Buffering' // Playing but stalled for data
-  | 'Completed' // Entire sequence watched (≥98%)
-  | 'Error';
-
-type PendingAction =
-  | {type: 'seek'; clipIdx: number; time: number; play: boolean}
-  | {type: 'resume'; clipIdx: number; time: number; play: boolean};
-
-interface SlotInfo {
+type SlotInfo = {
   clipIdx: number;
   uri: string;
-  duration?: number;
-}
+  loadKey: number;
+};
 
-interface SlotAssignments {
-  [slot: number]: SlotInfo | null;
-}
+type State = {
+  urlsLength: number;
 
-interface PlayerState {
-  phase: PlayerPhase;
-  preBufferPhase: PlayerPhase; // Phase to restore after buffering ends
+  activeSlot: Slot;
+  slots: [SlotInfo | null, SlotInfo | null];
+  slotLoadedKey: [number | null, number | null];
 
-  activePlayer: 0 | 1;
+  phase: Phase;
+  wantPlaying: boolean;
+
+  // External user gesture state (e.g. user is dragging the seek bar)
+  externalSeeking: boolean;
+
   currentIndex: number;
-  slotAssignments: SlotAssignments;
+  currentTime: number;
 
   times: number[];
-  currentTime: number;
-  watchedSeconds: number;
-  lastProgressClipIdx: number | null;
-  lastProgressTime: number;
 
-  version: number;
-  resumeKey: number;
+  isLoading: boolean;
+  needsProgressClear: boolean;
+  isBuffering: boolean;
+  error: any;
 
-  isSeeking: boolean; // External scrub state (from useScrubber)
-  pendingAction: PendingAction | null;
-  error: any | null;
-}
+  sequenceEndCount: number;
 
-type PlayerEvent =
-  // Video callbacks → reducer
-  | {type: 'LOAD_COMPLETE'; slotIdx: number; clipIdx: number; duration: number}
-  | {type: 'PROGRESS'; slotIdx: number; clipIdx: number; currentTime: number}
+  loadKeySeed: number;
+  seekToken: number;
+  appliedSeekToken: number;
+  pendingSeekTime: number | null;
+
+  playedSeconds: number;
+};
+
+type Action =
   | {
-      type: 'END_REACHED';
-      slotIdx: number;
-      clipIdx: number;
-      clipDuration: number;
-      totalDuration: number;
-      allDurationsKnown: boolean;
-      completionRatio: number;
+      type: 'INIT';
+      urlsLength: number;
+      firstUri: string;
+      externalSeeking: boolean;
     }
-  | {type: 'BUFFER_CHANGE'; slotIdx: number; isBuffering: boolean}
-  | {type: 'ERROR'; slotIdx: number; error: any}
-  // Consumer → reducer
-  | {type: 'PLAY'}
-  | {type: 'PAUSE'}
-  | {type: 'SET_SEEKING'; value: boolean}
-  // seekToClip callback decides which event to dispatch
-  | {type: 'UPDATE_CLIP_TIME'; clipIdx: number; time: number} // Same-clip seek: no phase change
+  | {type: 'SET_PLAYING'; playing: boolean}
+  | {type: 'SET_EXTERNAL_SEEKING'; isSeeking: boolean}
   | {
-      type: 'SWITCH_TO_CLIP';
-      player: 0 | 1;
-      index: number;
+      type: 'SEEK_TO_CLIP';
+      nextIdx: number;
       time: number;
+      uri: string;
       play: boolean;
-    } // Cross-clip, already loaded in target slot
-  | {type: 'SEEK_TO_LOAD'; clipIdx: number; time: number; play: boolean} // Cross-clip, NOT loaded — enter Loading
-  | {type: 'QUEUE_RESUME'; clipIdx: number; time: number}
-  | {type: 'RESET'; clipCount: number};
+    }
+  | {type: 'SEEK_WITHIN_CLIP'; time: number; play: boolean}
+  | {type: 'SEEK_APPLIED'; seekToken: number}
+  | {type: 'PRELOAD_SLOT'; slot: Slot; clipIdx: number; uri: string}
+  | {
+      type: 'RELOAD_ACTIVE';
+      idx: number;
+      time: number;
+      newUri: string;
+    }
+  | {
+      type: 'LOAD_SUCCESS';
+      slot: Slot;
+      clipIdx: number;
+      uri: string;
+      loadKey: number;
+    }
+  | {
+      type: 'PROGRESS';
+      slot: Slot;
+      clipIdx: number;
+      uri: string;
+      loadKey: number;
+      time: number;
+    }
+  | {
+      type: 'END';
+      slot: Slot;
+      clipIdx: number;
+      uri: string;
+      loadKey: number;
+      clipDuration: number;
+      nextIdx: number | null;
+      nextUri?: string;
+    }
+  | {
+      type: 'BUFFER';
+      slot: Slot;
+      clipIdx: number;
+      uri: string;
+      loadKey: number;
+      isBuffering: boolean;
+    }
+  | {
+      type: 'ERROR';
+      slot: Slot;
+      clipIdx: number;
+      uri: string;
+      loadKey: number;
+      error: any;
+    };
 
-// ======================= Reducer =======================
-
-function isActiveSlot(state: PlayerState, slotIdx: number): boolean {
-  return slotIdx === state.activePlayer;
+function otherSlot(s: Slot): Slot {
+  return s === 0 ? 1 : 0;
 }
 
-function updateTimes(
-  arr: number[],
-  len: number,
-  idx: number,
-  t: number,
-): number[] {
-  const next = arr.length === len ? [...arr] : Array(len).fill(0);
-  next[idx] = t;
-  return next;
+function ensureTimesLen(prev: number[], len: number): number[] {
+  if (prev.length === len) return prev;
+  return Array(len).fill(0);
 }
 
-function sumFinite(arr: number[]): number {
-  return arr.reduce((s, d) => (Number.isFinite(d) && d > 0 ? s + d : s), 0);
+function isValidAssignedEvent(
+  state: State,
+  slot: Slot,
+  clipIdx: number,
+  uri: string,
+  loadKey: number,
+) {
+  const info = state.slots[slot];
+  return (
+    !!info &&
+    info.clipIdx === clipIdx &&
+    info.uri === uri &&
+    info.loadKey === loadKey
+  );
 }
 
-function createInitialState(clipCount: number): PlayerState {
+function isValidActiveEvent(
+  state: State,
+  slot: Slot,
+  clipIdx: number,
+  uri: string,
+  loadKey: number,
+) {
+  if (slot !== state.activeSlot) return false;
+  return isValidAssignedEvent(state, slot, clipIdx, uri, loadKey);
+}
+
+function appendResumeParam(uri: string, key: number) {
+  const sep = uri.includes('?') ? '&' : '?';
+  return `${uri}${sep}_resume=${key}`;
+}
+
+function shouldPauseActive(state: State) {
+  switch (state.phase) {
+    case 'idle':
+    case 'ended':
+    case 'error':
+      return true;
+    case 'loading':
+      // Keep active slot unpaused while loading to avoid implementations that don't emit load callbacks when paused.
+      return false;
+    case 'loadedPendingSeek':
+    case 'seeking':
+    case 'ready':
+      return !state.wantPlaying;
+    default:
+      return true;
+  }
+}
+
+function initialState(): State {
   return {
-    phase: clipCount > 0 ? 'Loading' : 'Idle',
-    preBufferPhase: 'Paused',
-
-    activePlayer: 0,
+    urlsLength: 0,
+    activeSlot: 0,
+    slots: [null, null],
+    slotLoadedKey: [null, null],
+    phase: 'idle',
+    wantPlaying: false,
+    externalSeeking: false,
     currentIndex: 0,
-    slotAssignments: {0: null, 1: null},
-
-    times: Array(clipCount).fill(0),
     currentTime: 0,
-    watchedSeconds: 0,
-    lastProgressClipIdx: null,
-    lastProgressTime: 0,
-
-    version: 0,
-    resumeKey: 0,
-
-    isSeeking: false,
-    pendingAction: null,
+    times: [],
+    isLoading: false,
+    needsProgressClear: false,
+    isBuffering: false,
     error: null,
+    sequenceEndCount: 0,
+    loadKeySeed: 0,
+    seekToken: 0,
+    appliedSeekToken: 0,
+    pendingSeekTime: null,
+    playedSeconds: 0,
   };
 }
 
-function playerReducer(state: PlayerState, event: PlayerEvent): PlayerState {
-  switch (event.type) {
-    // ==========================================================
-    // RESET: URL list changed
-    // ==========================================================
-    case 'RESET': {
+function reducer(state: State, action: Action): State {
+  switch (action.type) {
+    case 'INIT': {
+      const {urlsLength} = action;
+      if (urlsLength <= 0) return initialState();
+
+      const first: SlotInfo = {
+        clipIdx: 0,
+        uri: action.firstUri,
+        loadKey: 1,
+      };
+
       return {
-        ...createInitialState(event.clipCount),
-        version: state.version + 1, // bust videoSlots memo
+        ...initialState(),
+        urlsLength,
+        slots: [first, null],
+        slotLoadedKey: [null, null],
+        activeSlot: 0,
+        phase: action.firstUri ? 'loading' : 'idle',
+        isLoading: !!action.firstUri,
+        needsProgressClear: !!action.firstUri,
+        loadKeySeed: 1,
+        times: Array(urlsLength).fill(0),
+        externalSeeking: action.externalSeeking,
       };
     }
 
-    // ==========================================================
-    // LOAD_COMPLETE: Video onLoad fired
-    // ==========================================================
-    case 'LOAD_COMPLETE': {
-      // Always update this slot's assignment so preload tracking works.
-      // (Previously this only updated when existing.clipIdx matched, but
-      // existing was always null from createInitialState, so slotAssignments
-      // was never populated — preload was never recognized by seekToClip.)
-      const newSlots = {...state.slotAssignments};
-      newSlots[event.slotIdx] = {
-        clipIdx: event.clipIdx,
-        uri: '',
-        duration: Number.isFinite(event.duration) ? event.duration : undefined,
-      };
+    case 'SET_PLAYING': {
+      // If the user pauses while we're waiting for a "settling" PROGRESS after seek,
+      // we should not rely on PROGRESS to exit the intermediate state.
+      if (!action.playing && state.phase === 'seeking') {
+        return {
+          ...state,
+          wantPlaying: false,
+          phase: 'ready',
+          isLoading: false,
+          needsProgressClear: false,
+          pendingSeekTime: null,
+        };
+      }
 
-      // Pending action consumed — this slot loaded the expected clip.
-      // Honor the play flag so the state machine exits Loading correctly.
+      // Prevent "playing intent" from being set in terminal/error states.
       if (
-        state.pendingAction &&
-        state.pendingAction.clipIdx === event.clipIdx &&
-        isActiveSlot(state, event.slotIdx)
+        action.playing &&
+        (state.phase === 'idle' ||
+          state.phase === 'ended' ||
+          state.phase === 'error')
       ) {
-        const nextPhase =
-          state.phase === 'Loading'
-            ? state.pendingAction.play
-              ? 'Playing'
-              : 'Paused'
-            : state.phase;
-        return {
-          ...state,
-          slotAssignments: newSlots,
-          phase: nextPhase,
-          pendingAction: null, // cleared; the seek was already executed in callback
-        };
-      }
-
-      // Inactive slot loaded — just update the slot record
-      if (!isActiveSlot(state, event.slotIdx)) {
-        return {
-          ...state,
-          slotAssignments: newSlots,
-        };
-      }
-
-      // Active slot, no pending action: stay in Loading (wait for first PROGRESS)
-      // but record the successful load.
-      return {
-        ...state,
-        slotAssignments: newSlots,
-      };
-    }
-
-    // ==========================================================
-    // PROGRESS: Time update from a video slot
-    // ==========================================================
-    case 'PROGRESS': {
-      // Guard: reject progress for non-active clip or non-active slot
-      if (event.clipIdx !== state.currentIndex) return state;
-      if (!isActiveSlot(state, event.slotIdx)) return state;
-
-      // Guard: suppress progress during external scrub (user dragging scrubber)
-      if (state.isSeeking) return state;
-
-      const t = Math.max(
-        0,
-        Number.isFinite(event.currentTime) ? event.currentTime : 0,
-      );
-
-      // --- Loading → Playing: first valid progress (transition if not already Playing) ---
-      if (state.phase === 'Loading') {
-        return {
-          ...state,
-          phase: 'Playing',
-          times: updateTimes(state.times, state.times.length, event.clipIdx, t),
-          lastProgressClipIdx: event.clipIdx,
-          lastProgressTime: t,
-          currentTime: t,
-        };
-      }
-
-      // --- Playing / Buffering: normal progress tracking ---
-      if (state.phase === 'Playing' || state.phase === 'Buffering') {
-        let watchedSeconds = state.watchedSeconds;
-        if (
-          state.lastProgressClipIdx === event.clipIdx &&
-          state.lastProgressTime > 0
-        ) {
-          const delta = t - state.lastProgressTime;
-          if (delta > 0 && delta <= MAX_PROGRESS_STEP) {
-            watchedSeconds += delta;
-          }
-        }
-
-        return {
-          ...state,
-          times: updateTimes(state.times, state.times.length, event.clipIdx, t),
-          lastProgressClipIdx: event.clipIdx,
-          lastProgressTime: t,
-          currentTime: t,
-          watchedSeconds,
-        };
-      }
-
-      return state;
-    }
-
-    // ==========================================================
-    // END_REACHED: Clip ended
-    // ==========================================================
-    case 'END_REACHED': {
-      // Guard: must be the active slot playing the current clip
-      if (event.slotIdx !== state.activePlayer) return state;
-      if (event.clipIdx !== state.currentIndex) return state;
-      if (state.phase !== 'Playing' && state.phase !== 'Buffering')
         return state;
-      // Don't auto-advance if a seek is pending
-      if (state.pendingAction) return state;
-
-      const clipIdx = state.currentIndex;
-
-      // Finalize watched seconds for this clip (add the "tail").
-      // Use clipDuration for the tail — currentTime equals lastProgressTime
-      // (both set to the same value in PROGRESS), so currentTime - lastProgressTime
-      // would always be 0.
-      let watchedSeconds = state.watchedSeconds;
-
-      const clipEnd =
-        event.clipDuration > 0 && Number.isFinite(event.clipDuration)
-          ? event.clipDuration
-          : state.currentTime;
-      if (state.lastProgressClipIdx === clipIdx && state.lastProgressTime > 0) {
-        const tail = clipEnd - state.lastProgressTime;
-        if (tail > 0 && tail <= MAX_PROGRESS_STEP) {
-          watchedSeconds += tail;
-        }
       }
 
-      if (clipIdx < state.times.length - 1) {
-        // ── Advance to next clip ──
-        const nextIdx = clipIdx + 1;
-        const nextPlayer = state.activePlayer === 0 ? 1 : 0;
-
-        // Only skip Loading if the target slot already has the next clip loaded
-        const preloadReady =
-          state.slotAssignments[nextPlayer]?.clipIdx === nextIdx;
-
-        const newTimes = [...state.times];
-        newTimes[clipIdx] = clipEnd;
-        newTimes[nextIdx] = 0;
-
-        return {
-          ...state,
-          phase: preloadReady ? 'Playing' : 'Loading',
-          activePlayer: nextPlayer,
-          currentIndex: nextIdx,
-          times: newTimes,
-          currentTime: 0,
-          watchedSeconds,
-          lastProgressClipIdx: null,
-          lastProgressTime: 0,
-          pendingAction: preloadReady
-            ? state.pendingAction
-            : {type: 'seek', clipIdx: nextIdx, time: 0, play: true},
-          version: state.version + 1,
-        };
-      } else {
-        // ── Last clip ended ──
-        const endT = clipEnd;
-        const newTimes = [...state.times];
-        newTimes[clipIdx] = endT;
-
-        const isComplete =
-          event.allDurationsKnown &&
-          event.totalDuration > 0 &&
-          watchedSeconds >= event.totalDuration * event.completionRatio;
-
-        return {
-          ...state,
-          phase: isComplete ? 'Completed' : 'Paused',
-          times: newTimes,
-          currentTime: endT,
-          watchedSeconds,
-          version: state.version + 1,
-        };
-      }
+      return {...state, wantPlaying: action.playing};
     }
 
-    // ==========================================================
-    // BUFFER_CHANGE: Buffer state changed
-    // ==========================================================
-    case 'BUFFER_CHANGE': {
-      if (!isActiveSlot(state, event.slotIdx)) return state;
-
-      if (event.isBuffering && state.phase === 'Playing') {
-        return {...state, phase: 'Buffering', preBufferPhase: 'Playing'};
-      }
-      if (event.isBuffering && state.phase === 'Paused') {
-        return {...state, phase: 'Buffering', preBufferPhase: 'Paused'};
-      }
-      // Dedup: already in Buffering with same isBuffering=true
-      if (event.isBuffering && state.phase === 'Buffering') return state;
-      // End buffering
-      if (!event.isBuffering && state.phase === 'Buffering') {
-        return {...state, phase: state.preBufferPhase};
-      }
-      return state;
+    case 'SET_EXTERNAL_SEEKING': {
+      return {...state, externalSeeking: action.isSeeking};
     }
 
-    // ==========================================================
-    // ERROR: Video error
-    // ==========================================================
-    case 'ERROR': {
-      if (!isActiveSlot(state, event.slotIdx)) return state;
-      return {...state, phase: 'Error', error: event.error};
-    }
+    case 'SEEK_WITHIN_CLIP': {
+      if (state.phase === 'idle' || state.phase === 'error') return state;
 
-    // ==========================================================
-    // PLAY / PAUSE: Consumer actions
-    // ==========================================================
-    case 'PLAY': {
-      // NOTE: Loading is NOT included here. During Loading the video is
-      // already unpaused (playing includes Loading), so PLAY is a no-op.
-      // This allows the loading overlay to stay visible during cross-clip
-      // seeks instead of being immediately overridden to Playing.
-      // Exit from Loading happens via LOAD_COMPLETE or first PROGRESS.
-      if (state.phase === 'Paused') {
-        return {...state, phase: 'Playing'};
-      }
-      // Allow user to request play during buffering — update preBufferPhase
-      // so when data arrives the video resumes instead of staying paused.
-      if (state.phase === 'Buffering') {
-        return {...state, preBufferPhase: 'Playing'};
-      }
-      // Retry after error — use 'resume' type so the cache-bust query param
-      // is appended, forcing react-native-video to reload the source.
-      if (state.phase === 'Error') {
-        return {
-          ...state,
-          phase: 'Loading',
-          pendingAction: {
-            type: 'resume',
-            clipIdx: state.currentIndex,
-            time: state.currentTime,
-            play: true,
-          },
-          resumeKey: state.resumeKey + 1,
-          version: state.version + 1,
-          error: null,
-        };
-      }
-      // Replay from beginning when completed.
-      // Use 'resume' pendingAction to force remount + seek to 0,
-      // and let LOAD_COMPLETE transition to Playing (play: true).
-      if (state.phase === 'Completed') {
-        return {
-          ...createInitialState(state.times.length),
-          pendingAction: {
-            type: 'resume',
-            clipIdx: 0,
-            time: 0,
-            play: true,
-          },
-          resumeKey: state.resumeKey + 1,
-          version: state.version + 1,
-        };
-      }
-      return state;
-    }
+      const times = ensureTimesLen(state.times, state.urlsLength).slice();
+      times[state.currentIndex] = action.time;
 
-    case 'PAUSE': {
-      if (state.phase === 'Playing' || state.phase === 'Loading') {
-        return {...state, phase: 'Paused'};
-      }
-      if (state.phase === 'Buffering') {
-        return {...state, phase: 'Paused', preBufferPhase: 'Paused'};
-      }
-      return state;
-    }
+      const seekToken = state.seekToken + 1;
+      const wantPlaying = action.play ? true : state.wantPlaying;
 
-    // ==========================================================
-    // SET_SEEKING: External scrub state (from useScrubber)
-    // ==========================================================
-    case 'SET_SEEKING': {
-      if (state.isSeeking === event.value) return state;
-      return {...state, isSeeking: event.value};
-    }
-
-    // ==========================================================
-    // UPDATE_CLIP_TIME: Same-clip seek — update time, no phase change
-    // ==========================================================
-    case 'UPDATE_CLIP_TIME': {
-      const newTimes = updateTimes(
-        state.times,
-        state.times.length,
-        event.clipIdx,
-        event.time,
-      );
       return {
         ...state,
-        times: newTimes,
-        currentTime: event.time,
-        lastProgressClipIdx: event.clipIdx,
-        lastProgressTime: event.time,
-        version: state.version + 1,
+        // If we're currently loading, keep `loading` but remember the pending seek.
+        phase: state.phase === 'loading' ? 'loading' : 'loadedPendingSeek',
+        wantPlaying,
+        currentTime: action.time,
+        times,
+        seekToken,
+        pendingSeekTime: action.time,
+        isBuffering: false,
+        error: null,
       };
     }
 
-    // ==========================================================
-    // SWITCH_TO_CLIP: Cross-clip, target ALREADY loaded in target slot
-    //                  Go to Playing/Paused directly (do NOT inherit
-    //                  Buffering from the previous clip).
-    // ==========================================================
-    case 'SWITCH_TO_CLIP': {
-      const newTimes = updateTimes(
-        state.times,
-        state.times.length,
-        event.index,
-        event.time,
-      );
-      const nextPhase = event.play ? 'Playing' : 'Paused';
+    case 'SEEK_APPLIED': {
+      // Only accept the current seekToken that matches the imperative seek() call.
+      if (state.phase !== 'loadedPendingSeek') return state;
+      if (action.seekToken !== state.seekToken) return state;
+
+      const nextPhase = state.wantPlaying ? 'seeking' : 'ready';
+
       return {
         ...state,
         phase: nextPhase,
-        activePlayer: event.player,
-        currentIndex: event.index,
-        times: newTimes,
-        currentTime: event.time,
-        lastProgressClipIdx: event.index,
-        lastProgressTime: event.time,
-        pendingAction: null,
-        version: state.version + 1,
+        appliedSeekToken: action.seekToken,
+        pendingSeekTime: state.wantPlaying ? state.pendingSeekTime : null,
+        isLoading: state.wantPlaying ? state.isLoading : false,
+        needsProgressClear: state.wantPlaying
+          ? state.needsProgressClear
+          : false,
       };
     }
 
-    // ==========================================================
-    // SEEK_TO_LOAD: Cross-clip, target NOT loaded — enter Loading,
-    //               set pendingAction so onLoad can seek there.
-    // ==========================================================
-    case 'SEEK_TO_LOAD': {
-      const nextPlayer = state.activePlayer === 0 ? 1 : 0;
-      const newTimes = updateTimes(
-        state.times,
-        state.times.length,
-        event.clipIdx,
-        event.time,
-      );
+    case 'SEEK_TO_CLIP': {
+      const inactiveSlot = otherSlot(state.activeSlot);
+      const preload = state.slots[inactiveSlot];
+      const hitPreload =
+        !!preload &&
+        preload.clipIdx === action.nextIdx &&
+        preload.uri === action.uri &&
+        state.slotLoadedKey[inactiveSlot] === preload.loadKey;
+
+      const times = ensureTimesLen(state.times, state.urlsLength).slice();
+      times[action.nextIdx] = action.time;
+
+      // Fast-path: preload is already loaded; swap activeSlot and seek without entering loading.
+      if (hitPreload) {
+        const wantPlaying = action.play ? true : state.wantPlaying;
+        const seekToken = state.seekToken + 1;
+
+        return {
+          ...state,
+          wantPlaying,
+          activeSlot: inactiveSlot,
+          phase: 'loadedPendingSeek',
+          isLoading: false,
+          needsProgressClear: false,
+          isBuffering: false,
+          error: null,
+          currentIndex: action.nextIdx,
+          currentTime: action.time,
+          times,
+          seekToken,
+          pendingSeekTime: action.time,
+        };
+      }
+
+      // Fallback: preload not hit (or not loaded yet); follow the normal loading path.
+      const nextLoadKey = state.loadKeySeed + 1;
+
+      const nextSlots: [SlotInfo | null, SlotInfo | null] = [
+        ...state.slots,
+      ] as any;
+      nextSlots[inactiveSlot] = {
+        clipIdx: action.nextIdx,
+        uri: action.uri,
+        loadKey: nextLoadKey,
+      };
+
+      const slotLoadedKey: [number | null, number | null] = [
+        ...state.slotLoadedKey,
+      ] as any;
+      slotLoadedKey[inactiveSlot] = null;
+
       return {
         ...state,
-        phase: 'Loading',
-        activePlayer: nextPlayer,
-        currentIndex: event.clipIdx,
-        times: newTimes,
-        currentTime: event.time,
-        lastProgressClipIdx: event.clipIdx,
-        lastProgressTime: event.time,
-        pendingAction: {
-          type: 'seek',
-          clipIdx: event.clipIdx,
-          time: event.time,
-          play: event.play,
-        },
-        version: state.version + 1,
+        wantPlaying: action.play ? true : state.wantPlaying,
+        activeSlot: inactiveSlot,
+        slots: nextSlots,
+        slotLoadedKey,
+        phase: 'loading',
+        isLoading: true,
+        needsProgressClear: true,
+        isBuffering: false,
+        error: null,
+        currentIndex: action.nextIdx,
+        currentTime: action.time,
+        times,
+        loadKeySeed: nextLoadKey,
+        seekToken: state.seekToken + 1,
+        pendingSeekTime: action.time,
       };
     }
 
-    // ==========================================================
-    // QUEUE_RESUME: Fullscreen resume (remount Video, resume at time)
-    // Does NOT change phase — keep Playing/Paused so video doesn't
-    // get stuck in Loading after being primed by PLAY.
-    // ==========================================================
-    case 'QUEUE_RESUME': {
+    case 'PRELOAD_SLOT': {
+      if (action.slot === state.activeSlot) return state;
+
+      // Allow preload refresh even for the same (clipIdx, uri) to support retry.
+      const nextLoadKey = state.loadKeySeed + 1;
+      const nextSlots: [SlotInfo | null, SlotInfo | null] = [
+        ...state.slots,
+      ] as any;
+      nextSlots[action.slot] = {
+        clipIdx: action.clipIdx,
+        uri: action.uri,
+        loadKey: nextLoadKey,
+      };
+
+      const slotLoadedKey: [number | null, number | null] = [
+        ...state.slotLoadedKey,
+      ] as any;
+      slotLoadedKey[action.slot] = null;
+
       return {
         ...state,
-        currentTime: event.time,
-        pendingAction: {
-          type: 'resume',
-          clipIdx: event.clipIdx,
-          time: event.time,
-          play: true,
-        },
-        resumeKey: state.resumeKey + 1,
-        version: state.version + 1,
+        slots: nextSlots,
+        slotLoadedKey,
+        loadKeySeed: nextLoadKey,
       };
+    }
+
+    case 'RELOAD_ACTIVE': {
+      // Reload: change (uri, loadKey) on the active slot to force a native reload.
+      const slot = state.activeSlot;
+      const existing = state.slots[slot];
+      if (!existing || existing.clipIdx !== action.idx) return state;
+
+      const nextLoadKey = state.loadKeySeed + 1;
+      const nextSlots: [SlotInfo | null, SlotInfo | null] = [
+        ...state.slots,
+      ] as any;
+      nextSlots[slot] = {
+        clipIdx: action.idx,
+        uri: action.newUri,
+        loadKey: nextLoadKey,
+      };
+
+      const slotLoadedKey: [number | null, number | null] = [
+        ...state.slotLoadedKey,
+      ] as any;
+      slotLoadedKey[slot] = null;
+
+      const times = ensureTimesLen(state.times, state.urlsLength).slice();
+      times[action.idx] = action.time;
+
+      return {
+        ...state,
+        slots: nextSlots,
+        slotLoadedKey,
+        phase: 'loading',
+        isLoading: true,
+        needsProgressClear: true,
+        isBuffering: false,
+        error: null,
+        currentTime: action.time,
+        times,
+        loadKeySeed: nextLoadKey,
+        seekToken: state.seekToken + 1,
+        pendingSeekTime: action.time,
+      };
+    }
+
+    case 'LOAD_SUCCESS': {
+      if (
+        !isValidAssignedEvent(
+          state,
+          action.slot,
+          action.clipIdx,
+          action.uri,
+          action.loadKey,
+        )
+      ) {
+        return state;
+      }
+
+      // Inactive slot: only record that this slot's current loadKey has loaded.
+      if (action.slot !== state.activeSlot) {
+        if (state.slotLoadedKey[action.slot] === action.loadKey) return state;
+        const slotLoadedKey: [number | null, number | null] = [
+          ...state.slotLoadedKey,
+        ] as any;
+        slotLoadedKey[action.slot] = action.loadKey;
+        return {...state, slotLoadedKey};
+      }
+
+      // Active slot: record loadedKey for consistency.
+      const slotLoadedKey: [number | null, number | null] = [
+        ...state.slotLoadedKey,
+      ] as any;
+      slotLoadedKey[action.slot] = action.loadKey;
+
+      // Some implementations may fire onLoad multiple times; ignore extra events once we're past loading.
+      if (
+        state.phase === 'ready' ||
+        state.phase === 'loadedPendingSeek' ||
+        state.phase === 'seeking'
+      ) {
+        return {...state, slotLoadedKey};
+      }
+
+      // Only loading is allowed to advance on LOAD_SUCCESS.
+      // Prevent stale LOAD_SUCCESS from resurrecting ended/error/idle.
+      if (state.phase !== 'loading') {
+        return {...state, slotLoadedKey};
+      }
+
+      const hasPendingSeek = state.seekToken !== state.appliedSeekToken;
+      const shouldWaitProgress = state.wantPlaying || hasPendingSeek;
+
+      return {
+        ...state,
+        slotLoadedKey,
+        phase: hasPendingSeek ? 'loadedPendingSeek' : 'ready',
+        error: null,
+        isBuffering: false,
+        isLoading: shouldWaitProgress ? state.isLoading : false,
+        needsProgressClear: shouldWaitProgress
+          ? state.needsProgressClear
+          : false,
+      };
+    }
+
+    case 'PROGRESS': {
+      if (
+        !isValidActiveEvent(
+          state,
+          action.slot,
+          action.clipIdx,
+          action.uri,
+          action.loadKey,
+        )
+      ) {
+        return state;
+      }
+      if (state.phase !== 'ready' && state.phase !== 'seeking') {
+        return state;
+      }
+      if (state.externalSeeking) {
+        return state;
+      }
+      if (state.seekToken !== state.appliedSeekToken) {
+        return state;
+      }
+
+      // Extra guard: only allow the active clip to update `times`.
+      if (state.currentIndex !== action.clipIdx) {
+        return state;
+      }
+
+      const t = action.time;
+      const target = state.currentTime;
+      const EPS = 0.5;
+      // Ignore stale progress emitted before seek has settled.
+      if (target > EPS && t < target - EPS) {
+        return state;
+      }
+
+      const times = ensureTimesLen(state.times, state.urlsLength).slice();
+      const prevT = state.currentTime;
+
+      let {playedSeconds} = state;
+      const delta = t - prevT;
+      if (delta > 0 && delta <= MAX_PROGRESS_STEP) {
+        playedSeconds += delta;
+      }
+
+      times[action.clipIdx] = t;
+
+      return {
+        ...state,
+        phase: 'ready',
+        currentTime: t,
+        times,
+        playedSeconds,
+        isLoading: state.needsProgressClear ? false : state.isLoading,
+        needsProgressClear: false,
+        pendingSeekTime: null,
+      };
+    }
+
+    case 'END': {
+      if (
+        !isValidActiveEvent(
+          state,
+          action.slot,
+          action.clipIdx,
+          action.uri,
+          action.loadKey,
+        )
+      ) {
+        return state;
+      }
+      if (state.phase !== 'ready' && state.phase !== 'seeking') {
+        return state;
+      }
+      if (
+        state.phase === 'seeking' &&
+        state.seekToken !== state.appliedSeekToken
+      ) {
+        return state;
+      }
+
+      const times = ensureTimesLen(state.times, state.urlsLength).slice();
+      const prevT = times[action.clipIdx] ?? state.currentTime;
+
+      let {playedSeconds} = state;
+      if (Number.isFinite(action.clipDuration) && action.clipDuration > 0) {
+        const tail = action.clipDuration - prevT;
+        if (tail > 0 && tail <= MAX_PROGRESS_STEP) {
+          playedSeconds += tail;
+        }
+      }
+
+      if (action.nextIdx == null || !action.nextUri) {
+        const endT =
+          Number.isFinite(action.clipDuration) && action.clipDuration > 0
+            ? action.clipDuration
+            : prevT;
+
+        times[action.clipIdx] = endT;
+
+        return {
+          ...state,
+          phase: 'ended',
+          wantPlaying: false,
+          currentTime: endT,
+          times,
+          playedSeconds,
+          isLoading: false,
+          needsProgressClear: false,
+          isBuffering: false,
+          sequenceEndCount: state.sequenceEndCount + 1,
+        };
+      }
+
+      const nextSlot = otherSlot(state.activeSlot);
+      const preload = state.slots[nextSlot];
+      const hitPreload =
+        !!preload &&
+        preload.clipIdx === action.nextIdx &&
+        preload.uri === action.nextUri &&
+        state.slotLoadedKey[nextSlot] === preload.loadKey;
+
+      // Finalize: write current clip to duration; reset next clip to 0.
+      if (Number.isFinite(action.clipDuration) && action.clipDuration > 0) {
+        times[action.clipIdx] = action.clipDuration;
+      }
+      times[action.nextIdx] = 0;
+
+      if (hitPreload) {
+        return {
+          ...state,
+          activeSlot: nextSlot,
+          phase: 'loadedPendingSeek',
+          isLoading: false,
+          needsProgressClear: false,
+          isBuffering: false,
+          error: null,
+          currentIndex: action.nextIdx,
+          currentTime: 0,
+          times,
+          playedSeconds,
+          seekToken: state.seekToken + 1,
+          pendingSeekTime: 0,
+        };
+      }
+
+      const nextLoadKey = state.loadKeySeed + 1;
+
+      const nextSlots: [SlotInfo | null, SlotInfo | null] = [
+        ...state.slots,
+      ] as any;
+      nextSlots[nextSlot] = {
+        clipIdx: action.nextIdx,
+        uri: action.nextUri,
+        loadKey: nextLoadKey,
+      };
+
+      const slotLoadedKey: [number | null, number | null] = [
+        ...state.slotLoadedKey,
+      ] as any;
+      slotLoadedKey[nextSlot] = null;
+
+      return {
+        ...state,
+        activeSlot: nextSlot,
+        slots: nextSlots,
+        slotLoadedKey,
+        phase: 'loading',
+        isLoading: true,
+        needsProgressClear: true,
+        isBuffering: false,
+        error: null,
+        currentIndex: action.nextIdx,
+        currentTime: 0,
+        times,
+        playedSeconds,
+        loadKeySeed: nextLoadKey,
+        seekToken: state.seekToken + 1,
+        pendingSeekTime: 0,
+      };
+    }
+
+    case 'BUFFER': {
+      if (
+        !isValidActiveEvent(
+          state,
+          action.slot,
+          action.clipIdx,
+          action.uri,
+          action.loadKey,
+        )
+      ) {
+        return state;
+      }
+      if (
+        state.phase === 'idle' ||
+        state.phase === 'ended' ||
+        state.phase === 'error'
+      ) {
+        return state;
+      }
+      return {...state, isBuffering: action.isBuffering};
+    }
+
+    case 'ERROR': {
+      // Active slot error => terminal error.
+      if (
+        isValidActiveEvent(
+          state,
+          action.slot,
+          action.clipIdx,
+          action.uri,
+          action.loadKey,
+        )
+      ) {
+        return {
+          ...state,
+          phase: 'error',
+          wantPlaying: false,
+          isLoading: false,
+          needsProgressClear: false,
+          isBuffering: false,
+          error: action.error,
+        };
+      }
+
+      // Inactive/preload slot error => invalidate preload only.
+      // Do not retry here.
+      // This prevents a previously loaded preload from being used after it later errors.
+      if (
+        isValidAssignedEvent(
+          state,
+          action.slot,
+          action.clipIdx,
+          action.uri,
+          action.loadKey,
+        )
+      ) {
+        const nextSlots: [SlotInfo | null, SlotInfo | null] = [
+          ...state.slots,
+        ] as any;
+        const slotLoadedKey: [number | null, number | null] = [
+          ...state.slotLoadedKey,
+        ] as any;
+        nextSlots[action.slot] = null;
+        slotLoadedKey[action.slot] = null;
+        return {
+          ...state,
+          slots: nextSlots,
+          slotLoadedKey,
+        };
+      }
+
+      return state;
     }
 
     default:
@@ -577,308 +796,141 @@ function playerReducer(state: PlayerState, event: PlayerEvent): PlayerState {
   }
 }
 
-// ======================= Hook =======================
-
 export function useVideoSequencePlayer({
   urls,
   durations,
   recordDuration,
+  isSeeking,
   getClipForTime,
-  completionRatio = 0.98,
+  onClipEnd,
 }: Params) {
-  // ======================= 基础 Refs =======================
   const playerRef0 = useRef<any>(null);
   const playerRef1 = useRef<any>(null);
   const playerRefs = useMemo(() => [playerRef0, playerRef1] as const, []);
 
-  // ── Refs for external values that the reducer/closures need ──
-  const recordDurationRef = useRef(recordDuration);
-  recordDurationRef.current = recordDuration;
+  const [state, dispatch] = useReducer(reducer, undefined, initialState);
+  const stateRef = useLatestRef(state);
 
-  // Refs for durations and completionRatio so onEnd always reads the latest
-  // values without adding them to the videoSlots memo dependency array
-  // (which would cause unnecessary re-computation on every duration update).
-  const durationsRef = useRef(durations);
-  durationsRef.current = durations;
+  const isSeekingRef = useLatestRef(isSeeking);
+  const playingRef = useLatestRef(state.wantPlaying);
+  const currentTimeRef = useRef(0);
+  const playedSecondsRef = useRef(0);
 
-  const completionRatioRef = useRef(completionRatio);
-  completionRatioRef.current = completionRatio;
-
-  // ======================= 状态机 =======================
-  const [state, dispatch] = useReducer(
-    playerReducer,
-    urls.length,
-    createInitialState,
-  );
-
-  // Sync latest state to a ref so callbacks (especially onLoad) can read it
-  const stateRef = useRef(state);
-  stateRef.current = state;
-
-  // ======================= Effect: 可靠执行 seek =======================
-  // 当 pendingAction 变化时，确保 active slot 执行 seek。
-  // 解决了 SEEK_TO_LOAD 路径中 onLoad 可能不触发导致 seek 丢失的问题。
   useEffect(() => {
-    const action = state.pendingAction;
-    if (!action || action.type !== 'seek') return;
-    const slot = state.activePlayer;
-    playerRefs[slot]?.current?.seek?.(action.time);
-  }, [state.pendingAction, state.activePlayer, playerRefs]);
+    currentTimeRef.current = state.currentTime;
+  }, [state.currentTime]);
 
-  // ======================= Refs for consumer backward compatibility =======================
-  // Include Loading so the video is unpaused during Loading — this allows
-  // the native player to load data and fire onProgress (which transitions
-  // Loading→Playing). isLoading is tracked separately for the loading overlay.
-  const playingRef = useRef(
-    state.phase === 'Playing' ||
-      state.phase === 'Buffering' ||
-      state.phase === 'Loading',
-  );
-  playingRef.current =
-    state.phase === 'Playing' ||
-    state.phase === 'Buffering' ||
-    state.phase === 'Loading';
+  useEffect(() => {
+    playedSecondsRef.current = state.playedSeconds;
+  }, [state.playedSeconds]);
 
-  const currentTimeRef = useRef(state.currentTime);
-  currentTimeRef.current = state.currentTime;
-
-  // ======================= Derived booleans =======================
-  const playing =
-    state.phase === 'Playing' ||
-    state.phase === 'Buffering' ||
-    state.phase === 'Loading';
-  const isLoading = state.phase === 'Loading';
-  const isBuffering = state.phase === 'Buffering';
-  const hasCompletedPlayback = state.phase === 'Completed';
-
-  // ======================= Helper: compute inactive slot preload index =======================
-  const computeInactiveIndex = useCallback((s: PlayerState): number => {
-    if (s.times.length === 0) return -1;
-    if (
-      s.pendingAction?.type === 'seek' &&
-      s.pendingAction.clipIdx !== s.currentIndex
-    ) {
-      return Math.min(s.pendingAction.clipIdx + 1, s.times.length - 1);
-    }
-    return Math.min(s.currentIndex + 1, s.times.length - 1);
-  }, []);
-
-  // ======================= videoSlots memo =======================
-  // We create inline closures here that capture slotIdx and clipIdx at memo time.
-  // For high-frequency callbacks (onBuffer, onError), we use stable dispatch wrappers.
-  const dispatchBufferChange0 = useRef((e: any) =>
+  // We intentionally only re-init on `urls` changes.
+  // `isSeekingRef.current` is only used to snapshot the latest external seeking state.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
     dispatch({
-      type: 'BUFFER_CHANGE',
-      slotIdx: 0,
-      isBuffering: !!e?.isBuffering,
-    }),
-  ).current;
-  const dispatchBufferChange1 = useRef((e: any) =>
-    dispatch({
-      type: 'BUFFER_CHANGE',
-      slotIdx: 1,
-      isBuffering: !!e?.isBuffering,
-    }),
-  ).current;
-  const dispatchError0 = useRef((e: any) =>
-    dispatch({type: 'ERROR', slotIdx: 0, error: e}),
-  ).current;
-  const dispatchError1 = useRef((e: any) =>
-    dispatch({type: 'ERROR', slotIdx: 1, error: e}),
-  ).current;
-
-  const videoSlots: VideoSlotProps[] = useMemo(() => {
-    return [0, 1].map(i => {
-      const isActive = i === state.activePlayer;
-      const videoIndex = isActive
-        ? state.currentIndex
-        : computeInactiveIndex(state);
-
-      if (videoIndex < 0 || videoIndex >= urls.length) {
-        return {
-          ref: playerRefs[i],
-          source: undefined,
-          paused: true,
-          onLoad: undefined,
-          onProgress: undefined,
-          onEnd: undefined,
-          onBuffer: undefined,
-          onError: undefined,
-        };
-      }
-
-      let uri = urls[videoIndex] ?? '';
-      // Cache-bust for resume: force Video remount by appending a unique query param
-      if (isActive && state.pendingAction?.type === 'resume') {
-        const sep = uri.includes('?') ? '&' : '?';
-        uri = `${uri}${sep}_resume=${state.resumeKey}`;
-      }
-
-      // ── onLoad: the one callback that needs imperative logic ──
-      const onLoad = (e: any) => {
-        const s0 = stateRef.current;
-        const dur = Number(e?.duration);
-
-        if (recordDurationRef.current && Number.isFinite(dur)) {
-          recordDurationRef.current(videoIndex, dur);
-        }
-
-        // Imperative seek if pending action targets this slot's clip
-        if (s0.pendingAction && s0.pendingAction.clipIdx === videoIndex) {
-          playerRefs[i].current?.seek?.(s0.pendingAction.time);
-        } else if (s0.activePlayer !== i) {
-          // Inactive slot: seek to 0 for proper preload positioning
-          playerRefs[i].current?.seek?.(0);
-        }
-
-        dispatch({
-          type: 'LOAD_COMPLETE',
-          slotIdx: i,
-          clipIdx: videoIndex,
-          duration: dur,
-        });
-      };
-
-      // ── onProgress ──
-      const onProgress = isActive
-        ? (e: any) => {
-            dispatch({
-              type: 'PROGRESS',
-              slotIdx: i,
-              clipIdx: videoIndex,
-              currentTime: e?.currentTime ?? 0,
-            });
-          }
-        : undefined;
-
-      // ── onEnd ──
-      // Read durations/completionRatio from refs to avoid stale closures
-      // (these props are NOT in the memo dependency array by design).
-      const onEnd = isActive
-        ? () => {
-            const d = durationsRef.current;
-            const rawCd = d[videoIndex];
-            const cd = Number.isFinite(rawCd) && rawCd > 0 ? rawCd : 0;
-            const total = sumFinite(d);
-            const allKnown =
-              d.length > 0 && d.every(dd => Number.isFinite(dd) && dd > 0);
-            dispatch({
-              type: 'END_REACHED',
-              slotIdx: i,
-              clipIdx: videoIndex,
-              clipDuration: cd,
-              totalDuration: total,
-              allDurationsKnown: allKnown,
-              completionRatio: completionRatioRef.current,
-            });
-          }
-        : undefined;
-
-      return {
-        ref: playerRefs[i],
-        source: uri ? {uri, bufferConfig: BUFFER_CONFIG} : undefined,
-        paused: isActive ? !playing : true,
-        onLoad,
-        onProgress,
-        onEnd,
-        onBuffer: i === 0 ? dispatchBufferChange0 : dispatchBufferChange1,
-        onError: i === 0 ? dispatchError0 : dispatchError1,
-      };
+      type: 'INIT',
+      urlsLength: urls.length,
+      firstUri: urls[0] ?? '',
+      externalSeeking: isSeekingRef.current,
     });
+  }, [urls]);
+
+  useEffect(() => {
+    dispatch({type: 'SET_EXTERNAL_SEEKING', isSeeking});
+  }, [isSeeking]);
+
+  useEffect(() => {
+    const s = stateRef.current;
+    if (s.phase !== 'loadedPendingSeek') return;
+    if (s.seekToken === s.appliedSeekToken) return;
+
+    const player = playerRefs[s.activeSlot].current;
+    if (typeof player?.seek !== 'function') return;
+
+    player.seek(s.pendingSeekTime ?? s.currentTime);
+    dispatch({type: 'SEEK_APPLIED', seekToken: s.seekToken});
   }, [
-    state.phase,
-    state.activePlayer,
-    state.currentIndex,
-    state.pendingAction,
-    state.resumeKey,
-    state.times.length,
     playerRefs,
-    playing,
-    urls,
-    computeInactiveIndex,
+    stateRef,
+    state.activeSlot,
+    state.phase,
+    state.seekToken,
+    state.appliedSeekToken,
+    state.pendingSeekTime,
+    state.currentTime,
   ]);
 
-  // ======================= URL reset effect =======================
-  // Use a stable string key so the effect only fires when the URL list
-  // content actually changes, not when the array reference differs.
-  const urlsKey = urls.join('\n');
   useEffect(() => {
-    dispatch({type: 'RESET', clipCount: urls.length});
-    // Reset imperative player state
-    playerRef0.current?.seek?.(0);
-    playerRef1.current?.seek?.(0);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [urlsKey]);
+    if (urls.length === 0) return;
+    if (state.phase !== 'ready') return;
 
-  // ======================= 公共 API =======================
-  const setPlaying = useCallback((value: boolean) => {
-    dispatch({type: value ? 'PLAY' : 'PAUSE'});
-  }, []);
+    const nextIdx = Math.min(state.currentIndex + 1, urls.length - 1);
+    if (nextIdx === state.currentIndex) return;
 
-  const setIsLoading = useCallback((_value: boolean) => {
-    // Loading phase is managed internally by the state machine.
-    // This is a no-op kept for consumer backward compatibility.
-  }, []);
+    const slot = otherSlot(state.activeSlot);
+    const uri = urls[nextIdx] ?? '';
+    if (!uri) return;
+
+    // Avoid repeating preload dispatches while already ready.
+    const existing = state.slots[slot];
+    if (existing && existing.clipIdx === nextIdx && existing.uri === uri)
+      return;
+
+    dispatch({type: 'PRELOAD_SLOT', slot, clipIdx: nextIdx, uri});
+  }, [state.activeSlot, state.currentIndex, state.phase, state.slots, urls]);
+
+  const getTotalDuration = useCallback(
+    () =>
+      durations.reduce((s, d) => (Number.isFinite(d) && d > 0 ? s + d : s), 0),
+    [durations],
+  );
+
+  const allDurationsKnown = useCallback(
+    () =>
+      durations.length === urls.length &&
+      durations.every(d => Number.isFinite(d) && d > 0),
+    [durations, urls.length],
+  );
+
+  const setPlaying = useCallback(
+    (next: boolean | ((prev: boolean) => boolean)) => {
+      const n = typeof next === 'function' ? next(playingRef.current) : next;
+      dispatch({type: 'SET_PLAYING', playing: n});
+    },
+    [playingRef],
+  );
 
   const seekToClip = useCallback(
     (idx: number, localSeconds: number, opts?: SeekOptions) => {
       if (urls.length === 0) return;
+
       const play = opts?.play ?? true;
-      const t = Math.max(0, Number(localSeconds) || 0);
-      const safeIdx = Math.max(0, Math.min(idx, urls.length - 1));
+      const nextIdx = Math.max(0, Math.min(urls.length - 1, idx));
+
+      let t = Math.max(0, Number(localSeconds) || 0);
+      const dur = durations[nextIdx] ?? 0;
+      if (Number.isFinite(dur) && dur > 0 && t > dur) t = dur;
+
       const s = stateRef.current;
-
-      if (safeIdx === s.currentIndex) {
-        // Same clip: imperative seek + update time, no phase change
-        playerRefs[s.activePlayer]?.current?.seek?.(t);
-        dispatch({type: 'UPDATE_CLIP_TIME', clipIdx: safeIdx, time: t});
-        if (play) {
-          if (s.phase === 'Paused') dispatch({type: 'PLAY'});
-        } else {
-          if (s.phase === 'Playing' || s.phase === 'Buffering') {
-            dispatch({type: 'PAUSE'});
-          }
-        }
-      } else {
-        // Cross-clip: check if target clip is already loaded in target slot
-        const nextPlayer = s.activePlayer === 0 ? 1 : 0;
-        const loaded = s.slotAssignments[nextPlayer];
-
-        if (loaded && loaded.clipIdx === safeIdx) {
-          // Already loaded — imperative seek + switch slot, no Loading phase
-          playerRefs[nextPlayer]?.current?.seek?.(t);
-          dispatch({
-            type: 'SWITCH_TO_CLIP',
-            player: nextPlayer as 0 | 1,
-            index: safeIdx,
-            time: t,
-            play,
-          });
-        } else {
-          // Not loaded yet — enter Loading, onLoad will handle the seek
-          dispatch({type: 'SEEK_TO_LOAD', clipIdx: safeIdx, time: t, play});
-        }
+      if (nextIdx === s.currentIndex) {
+        dispatch({type: 'SEEK_WITHIN_CLIP', time: t, play});
+        return;
       }
-    },
-    [urls.length, playerRefs, stateRef],
-  );
 
-  const queueResumeForCurrentClip = useCallback((): SeekRequest => {
-    const payload = {
-      idx: stateRef.current.currentIndex,
-      time:
-        Number.isFinite(stateRef.current.currentTime) &&
-        stateRef.current.currentTime >= 0
-          ? stateRef.current.currentTime
-          : 0,
-    };
-    dispatch({
-      type: 'QUEUE_RESUME',
-      clipIdx: payload.idx,
-      time: payload.time,
-    });
-    return payload;
-  }, []);
+      const uri = urls[nextIdx] ?? '';
+      if (!uri) return;
+
+      dispatch({
+        type: 'SEEK_TO_CLIP',
+        nextIdx,
+        time: t,
+        uri,
+        play,
+      });
+    },
+    [durations, stateRef, urls],
+  );
 
   const seekVirtual = useCallback(
     (t: number, opts?: SeekOptions) => {
@@ -889,29 +941,159 @@ export function useVideoSequencePlayer({
     [getClipForTime, seekToClip],
   );
 
-  const setIsSeeking = useCallback(
-    (value: boolean) => dispatch({type: 'SET_SEEKING', value}),
-    [],
-  );
-  console.log('🚀 >>> state', state);
+  const resumeKeyRef = useRef(0);
+  const queueResumeForCurrentClip = useCallback((): SeekRequest => {
+    const s = stateRef.current;
+    const idx = s.currentIndex;
+    const localT =
+      Number.isFinite(s.currentTime) && s.currentTime >= 0
+        ? s.currentTime
+        : s.times[idx] ?? 0;
+
+    const payload = {idx, time: localT};
+
+    const baseUri = urls[idx] ?? '';
+    resumeKeyRef.current += 1;
+    const newUri = baseUri
+      ? appendResumeParam(baseUri, resumeKeyRef.current)
+      : baseUri;
+
+    if (newUri) {
+      dispatch({
+        type: 'RELOAD_ACTIVE',
+        idx,
+        time: localT,
+        newUri,
+      });
+    }
+
+    return payload;
+  }, [stateRef, urls]);
+
+  // Video slots (identity injected)
+  const videoSlots: VideoSlotProps[] = useMemo(() => {
+    return ([0, 1] as const).map(slot => {
+      const info = state.slots[slot];
+      const isActive = slot === state.activeSlot;
+
+      if (!info || !info.uri) {
+        return {
+          ref: playerRefs[slot],
+          source: undefined,
+          paused: true,
+          onLoad: undefined,
+          onProgress: undefined,
+          onEnd: undefined,
+          onBuffer: undefined,
+          onError: undefined,
+        };
+      }
+
+      const {clipIdx, uri, loadKey} = info;
+
+      return {
+        ref: playerRefs[slot],
+        source: {uri, bufferConfig: BUFFER_CONFIG},
+        // Keep active slot unpaused while loading to avoid implementations that don't emit load callbacks when paused.
+        paused: !isActive || shouldPauseActive(state),
+        onLoad: (e: any) => {
+          const d = Number(e?.duration);
+          if (recordDuration && Number.isFinite(d)) recordDuration(clipIdx, d);
+
+          dispatch({
+            type: 'LOAD_SUCCESS',
+            slot,
+            clipIdx,
+            uri,
+            loadKey,
+          });
+        },
+        onProgress: isActive
+          ? (e: any) => {
+              const t = Number(e?.currentTime ?? 0);
+              if (!Number.isFinite(t)) return;
+
+              dispatch({
+                type: 'PROGRESS',
+                slot,
+                clipIdx,
+                uri,
+                loadKey,
+                time: t,
+              });
+            }
+          : undefined,
+        onEnd: isActive
+          ? () => {
+              const s = stateRef.current;
+              if (!isValidActiveEvent(s, slot, clipIdx, uri, loadKey)) return;
+              if (s.phase !== 'ready' && s.phase !== 'seeking') return;
+              if (s.phase === 'seeking' && s.seekToken !== s.appliedSeekToken) {
+                return;
+              }
+
+              const clipDuration = Number(durations[clipIdx] ?? 0);
+              const hasNext = clipIdx < urls.length - 1;
+              const nextIdx = hasNext ? clipIdx + 1 : null;
+              const nextUri = hasNext ? urls[clipIdx + 1] ?? '' : undefined;
+
+              onClipEnd?.({idx: clipIdx, uri, duration: clipDuration});
+
+              dispatch({
+                type: 'END',
+                slot,
+                clipIdx,
+                uri,
+                loadKey,
+                clipDuration,
+                nextIdx,
+                nextUri,
+              });
+            }
+          : undefined,
+        onBuffer: (e: any) => {
+          dispatch({
+            type: 'BUFFER',
+            slot,
+            clipIdx,
+            uri,
+            loadKey,
+            isBuffering: !!e?.isBuffering,
+          });
+        },
+        onError: (e: any) => {
+          dispatch({
+            type: 'ERROR',
+            slot,
+            clipIdx,
+            uri,
+            loadKey,
+            error: e,
+          });
+        },
+      };
+    });
+  }, [durations, onClipEnd, playerRefs, recordDuration, state, stateRef, urls]);
 
   return {
     videoSlots,
-    activePlayer: state.activePlayer,
-    playing,
+    activePlayer: state.activeSlot,
+    playing: state.wantPlaying,
     setPlaying,
     playingRef,
-    hasCompletedPlayback,
-    isLoading,
-    setIsLoading,
-    isBuffering,
+
+    sequenceEndCount: state.sequenceEndCount,
+    playedSecondsRef,
+    getTotalDuration,
+    allDurationsKnown,
+
+    isLoading: state.isLoading,
+    isBuffering: state.isBuffering,
     error: state.error,
     currentIndex: state.currentIndex,
     currentTimeRef,
     times: state.times,
-    version: state.version,
-    isSeeking: state.isSeeking,
-    setIsSeeking,
+
     seekToClip,
     seekVirtual,
     queueResumeForCurrentClip,

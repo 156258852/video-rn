@@ -1,6 +1,6 @@
 import React, {useMemo, useRef, useState, useCallback, useEffect} from 'react';
 import {PanResponder, View} from 'react-native';
-import {useLatestRef} from './useLatestRef';
+import {useLatestRef} from '../utils';
 
 type UseScrubberParams = {
   enabled: boolean;
@@ -9,6 +9,8 @@ type UseScrubberParams = {
   onCommit: (t: number, reason: string) => void;
   onSeekingChange?: (seeking: boolean) => void;
   clearPreviewDelayMs?: number;
+  gestureAxis?: 'x' | 'y';
+  gestureAxisReversed?: boolean;
 };
 
 type UseScrubberResult = {
@@ -16,9 +18,10 @@ type UseScrubberResult = {
   displayedTime: number;
   fillW: number;
   thumbLeft: number;
-  trackRef: React.RefObject<View>;
+  trackRef: React.RefObject<View | null>;
   onTrackLayout: (e: any) => void;
   panHandlers: any;
+  measureTrack: () => void;
 };
 
 export function useScrubber({
@@ -28,6 +31,8 @@ export function useScrubber({
   onCommit,
   onSeekingChange,
   clearPreviewDelayMs = 150,
+  gestureAxis = 'x',
+  gestureAxisReversed = false,
 }: UseScrubberParams): UseScrubberResult {
   const trackRef = useRef<View>(null);
   const [trackW, setTrackW] = useState(0);
@@ -36,9 +41,11 @@ export function useScrubber({
   const [previewTime, setPreviewTime] = useState<number | null>(null);
   const [previewX, setPreviewX] = useState<number | null>(null);
 
-  const scrubStartXRef = useRef(0);
   const scrubCurrentXRef = useRef(0);
   const trackPageXRef = useRef(0);
+  const trackPageYRef = useRef(0);
+  const trackScreenWRef = useRef(0);
+  const trackScreenHRef = useRef(0);
   const clearPreviewTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
   );
@@ -51,6 +58,8 @@ export function useScrubber({
   const onCommitRef = useLatestRef(onCommit);
   const onSeekingChangeRef = useLatestRef(onSeekingChange);
   const clearPreviewDelayMsRef = useLatestRef(clearPreviewDelayMs);
+  const gestureAxisRef = useLatestRef(gestureAxis);
+  const gestureAxisReversedRef = useLatestRef(gestureAxisReversed);
 
   useEffect(() => {
     return () => {
@@ -86,19 +95,104 @@ export function useScrubber({
   }, [displayedX, trackW]);
 
   const thumbLeft = useMemo(() => {
-    return Math.max(0, displayedX - 8);
-  }, [displayedX]);
+    const THUMB_SIZE = 20;
+    if (!trackW) {
+      return 0;
+    }
+    const left = displayedX - THUMB_SIZE / 2;
+    return Math.max(0, Math.min(trackW - THUMB_SIZE, left));
+  }, [displayedX, trackW]);
 
-  const onTrackLayout = useCallback((e: any) => {
-    const w = Number(e?.nativeEvent?.layout?.width ?? 0);
-    setTrackW(w);
-    // Measure absolute screen position for locationX fallback in PanResponder
-    trackRef.current?.measureInWindow?.((x: number) => {
-      if (Number.isFinite(x)) {
-        trackPageXRef.current = x;
-      }
-    });
+  const measureTrack = useCallback(() => {
+    trackRef.current?.measureInWindow?.(
+      (x: number, y: number, width: number, height: number) => {
+        if (Number.isFinite(x)) {
+          trackPageXRef.current = x;
+        }
+        if (Number.isFinite(y)) {
+          trackPageYRef.current = y;
+        }
+        if (Number.isFinite(width)) {
+          trackScreenWRef.current = width;
+        }
+        if (Number.isFinite(height)) {
+          trackScreenHRef.current = height;
+        }
+      },
+    );
   }, []);
+
+  const onTrackLayout = useCallback(
+    (e: any) => {
+      const w = Number(e?.nativeEvent?.layout?.width ?? 0);
+      setTrackW(w);
+      measureTrack();
+    },
+    [measureTrack],
+  );
+
+  const clampToTrack = useCallback((x: number, w: number) => {
+    return Math.max(0, Math.min(w, x));
+  }, []);
+
+  const getLogicalXFromEvent = useCallback(
+    (evt: any) => {
+      const w = trackWRef.current;
+      if (w <= 0) {
+        return 0;
+      }
+
+      const ne = evt?.nativeEvent;
+      const axis = gestureAxisRef.current;
+
+      if (axis === 'y') {
+        const pgY = Number(ne?.pageY);
+        const startY = trackPageYRef.current;
+        const screenH = trackScreenHRef.current;
+
+        if (Number.isFinite(pgY) && Number.isFinite(startY) && screenH > 0) {
+          let screenOffset = pgY - startY;
+          if (gestureAxisReversedRef.current) {
+            screenOffset = screenH - screenOffset;
+          }
+          return (clampToTrack(screenOffset, screenH) / screenH) * w;
+        }
+
+        return scrubCurrentXRef.current;
+      }
+
+      const locX = Number(ne?.locationX);
+      if (Number.isFinite(locX)) {
+        return clampToTrack(locX, w);
+      }
+
+      const pgX = Number(ne?.pageX);
+      const startX = trackPageXRef.current;
+      if (Number.isFinite(pgX) && Number.isFinite(startX)) {
+        return clampToTrack(pgX - startX, w);
+      }
+
+      return scrubCurrentXRef.current;
+    },
+    [clampToTrack, gestureAxisRef, gestureAxisReversedRef, trackWRef],
+  );
+
+  const updatePreviewFromX = useCallback(
+    (x: number) => {
+      const w = trackWRef.current;
+      const tot = totalRef.current;
+      const clampedX = clampToTrack(x, w);
+
+      scrubCurrentXRef.current = clampedX;
+      setPreviewX(clampedX);
+
+      if (w > 0 && tot > 0) {
+        const t = Math.max(0, Math.min(tot, (clampedX / w) * tot));
+        setPreviewTime(t);
+      }
+    },
+    [clampToTrack, totalRef, trackWRef],
+  );
 
   // PanResponder is created ONCE and never recreated. All callbacks read from
   // refs so they always use the current values without triggering a new
@@ -113,58 +207,13 @@ export function useScrubber({
           clearPreviewTimeoutRef.current = null;
         }
 
+        measureTrack();
         setIsSeeking(true);
         onSeekingChangeRef.current?.(true);
-
-        const ne = evt?.nativeEvent;
-        const locX = Number(ne?.locationX);
-        const pgX = Number(ne?.pageX);
-        // locationX can be unreliable on some Android devices; fall back to
-        // pageX - trackPageX (measured in onTrackLayout via measureInWindow)
-        const x = Number.isFinite(locX)
-          ? locX
-          : Number.isFinite(pgX) && trackPageXRef.current > 0
-          ? pgX - trackPageXRef.current
-          : 0;
-        scrubStartXRef.current = x;
-        scrubCurrentXRef.current = x;
-
-        const w = trackWRef.current;
-        const tot = totalRef.current;
-        if (w > 0 && tot > 0) {
-          const t = Math.max(
-            0,
-            Math.min(tot, (Math.max(0, Math.min(w, x)) / w) * tot),
-          );
-          setPreviewTime(t);
-        }
-        setPreviewX(x);
+        updatePreviewFromX(getLogicalXFromEvent(evt));
       },
-      onPanResponderMove: (evt, gesture) => {
-        const ne = evt?.nativeEvent;
-        const locX = Number(ne?.locationX);
-        const pgX = Number(ne?.pageX);
-        const locationX = Number.isFinite(locX)
-          ? locX
-          : Number.isFinite(pgX) && trackPageXRef.current > 0
-          ? pgX - trackPageXRef.current
-          : 0;
-        const x = Number.isFinite(gesture?.dx)
-          ? scrubStartXRef.current + gesture.dx
-          : locationX;
-
-        scrubCurrentXRef.current = x;
-
-        const w = trackWRef.current;
-        const tot = totalRef.current;
-        if (w > 0 && tot > 0) {
-          const t = Math.max(
-            0,
-            Math.min(tot, (Math.max(0, Math.min(w, x)) / w) * tot),
-          );
-          setPreviewTime(t);
-        }
-        setPreviewX(x);
+      onPanResponderMove: evt => {
+        updatePreviewFromX(getLogicalXFromEvent(evt));
       },
       onPanResponderRelease: () => {
         const x = scrubCurrentXRef.current;
@@ -194,7 +243,6 @@ export function useScrubber({
           clearPreviewTimeoutRef.current = null;
         }, delay);
 
-        scrubStartXRef.current = 0;
         scrubCurrentXRef.current = 0;
       },
       onPanResponderTerminate: () => {
@@ -202,7 +250,6 @@ export function useScrubber({
         setPreviewX(null);
         setIsSeeking(false);
         onSeekingChangeRef.current?.(false);
-        scrubStartXRef.current = 0;
         scrubCurrentXRef.current = 0;
       },
     }),
@@ -216,5 +263,6 @@ export function useScrubber({
     trackRef,
     onTrackLayout,
     panHandlers: panResponder.panHandlers,
+    measureTrack,
   };
 }

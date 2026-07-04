@@ -1,5 +1,6 @@
-import React, {useCallback, useEffect, useState, useMemo} from 'react';
-import Video from 'react-native-video';
+import React, {useCallback, useState, useMemo} from 'react';
+import {Platform, View} from 'react-native';
+import Video, {ViewType} from 'react-native-video';
 
 type OnLoadData = {duration: number};
 
@@ -9,21 +10,29 @@ type UseVideoDurationsResult = {
   preloadNode: React.ReactNode;
 };
 
+type UseVideoDurationsOptions = {
+  /**
+   * When false, do not mount the hidden <Video> preloader node.
+   * Useful when durations/preload are managed by an outer provider layer.
+   */
+  enabled?: boolean;
+};
+
 /**
  * Preloads each URL (one at a time) to read its duration from <Video onLoad>.
  * Also exposes recordDuration(idx, duration) so your "real" players can fill gaps.
  */
 const preloadVideoStyle = {width: 1, height: 1, opacity: 0};
 
-export function useVideoDurations(urls: string[]): UseVideoDurationsResult {
+export function useVideoDurations(
+  urls: string[],
+  options?: UseVideoDurationsOptions,
+): UseVideoDurationsResult {
+  const enabled = options?.enabled ?? true;
+
   const [durations, setDurations] = useState<number[]>(() =>
     Array(urls.length).fill(NaN),
   );
-
-  // Reset whenever the URL list changes.
-  useEffect(() => {
-    setDurations(Array(urls.length).fill(NaN));
-  }, [urls]);
 
   const recordDuration = useCallback(
     (idx: number, durationSeconds: number) => {
@@ -60,28 +69,25 @@ export function useVideoDurations(urls: string[]): UseVideoDurationsResult {
     return durations.findIndex(d => !Number.isFinite(d));
   }, [durations, urls.length]);
 
-  const done = urls.length === 0 || preloadIndex === -1;
+  const done = !enabled || urls.length === 0 || preloadIndex === -1;
 
   const preloadNode = !done ? (
-    <Video
-      // force remount per URL to avoid stale onLoad behaviour
-      key={`dur-preload-${preloadIndex}-${urls[preloadIndex]}`}
-      source={{uri: urls[preloadIndex], bufferConfig: {cacheSizeMB: 200}}}
-      paused={true}
-      muted={true}
-      controls={false}
-      playInBackground={false}
-      playWhenInactive={false}
-      onLoad={(e: OnLoadData) => {
-        console.log('useVideoDurations onLoad', {
-          preloadIndex,
-          uri: urls[preloadIndex],
-          duration: e.duration,
-        });
-        recordDuration(preloadIndex, e.duration);
-      }}
-      style={preloadVideoStyle}
-    />
+    <View pointerEvents="none">
+      <Video
+        // force remount per URL to avoid stale onLoad behaviour
+        key={`dur-preload-${preloadIndex}-${urls[preloadIndex]}`}
+        pointerEvents="none"
+        source={{uri: urls[preloadIndex], bufferConfig: {cacheSizeMB: 200}}}
+        paused
+        muted
+        controls={false}
+        playInBackground={false}
+        playWhenInactive={false}
+        viewType={Platform.OS === 'android' ? ViewType.TEXTURE : undefined}
+        onLoad={(e: OnLoadData) => recordDuration(preloadIndex, e.duration)}
+        style={preloadVideoStyle}
+      />
+    </View>
   ) : null;
 
   return {

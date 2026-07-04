@@ -1,6 +1,6 @@
 import {useCallback, useEffect, useRef, useState} from 'react';
-import {useLatestRef} from './useLatestRef';
 import {Animated} from 'react-native';
+import {useLatestRef} from '../utils';
 
 type UseAutoHideControlsParams = {
   enabled: boolean;
@@ -20,7 +20,7 @@ type UseAutoHideControlsResult = {
 export function useAutoHideControls({
   enabled,
   playing,
-  delayMs = 3500,
+  delayMs = 3000,
 }: UseAutoHideControlsParams): UseAutoHideControlsResult {
   const [visible, setVisible] = useState(true);
   const visibleRef = useLatestRef(visible);

@@ -1,22 +1,44 @@
-import {useCallback, useMemo} from 'react';
+import {useCallback, useState} from 'react';
 
 import {useVideoDurations} from './useVideoDurations';
 import {useVideoSequencePlayer} from './useVideoSequencePlayer';
 import {useVirtualTimeline} from './useVirtualTimeline';
 
+type ClipEndPayload = {idx: number; uri: string; duration: number};
+
+type RecordDuration = (idx: number, durationSeconds: number) => void;
+
 type UseVideoSequenceTimelinePlayerParams = {
   urls: string[];
+  onClipEnd?: (payload: ClipEndPayload) => void;
+  durations?: number[];
+  recordDuration?: RecordDuration;
+  enablePreload?: boolean;
+};
+
+type SeekVirtualOptions = {
+  play?: boolean;
 };
 
 export function useVideoSequenceTimelinePlayer({
   urls,
+  onClipEnd,
+  durations: externalDurations,
+  recordDuration: externalRecordDuration,
+  enablePreload = true,
 }: UseVideoSequenceTimelinePlayerParams) {
-  const {durations, recordDuration, preloadNode} = useVideoDurations(urls);
+  const [isSeeking, setIsSeeking] = useState(false);
+  const durationState = useVideoDurations(urls, {enabled: enablePreload});
+  const durations = externalDurations ?? durationState.durations;
+  const recordDuration = externalRecordDuration ?? durationState.recordDuration;
+  const {preloadNode} = durationState;
 
   const player = useVideoSequencePlayer({
     urls,
     durations,
     recordDuration,
+    isSeeking,
+    onClipEnd,
   });
 
   // Use times[currentIndex] (state) as currentTime so useVirtualTimeline
@@ -28,16 +50,15 @@ export function useVideoSequenceTimelinePlayer({
     durations,
     currentIndex: player.currentIndex,
     currentTime,
-    version: player.version,
   });
 
   // Override seekVirtual: resolve virtual time → clip+local via timeline,
   // then delegate to player.seekToClip. Explicit to avoid ambiguity with
   // player.seekVirtual (which requires getClipForTime prop, not wired here).
   const seekVirtual = useCallback(
-    (t: number) => {
+    (t: number, opts?: SeekVirtualOptions) => {
       const {idx, local} = timeline.getClipForTime(t);
-      player.seekToClip(idx, local, {play: true});
+      player.seekToClip(idx, local, {play: opts?.play ?? true});
     },
     [player, timeline],
   );
@@ -53,7 +74,10 @@ export function useVideoSequenceTimelinePlayer({
     playing: player.playing,
     setPlaying: player.setPlaying,
     playingRef: player.playingRef,
-    hasCompletedPlayback: player.hasCompletedPlayback,
+    sequenceEndCount: player.sequenceEndCount,
+    playedSecondsRef: player.playedSecondsRef,
+    getTotalDuration: player.getTotalDuration,
+    allDurationsKnown: player.allDurationsKnown,
     isLoading: player.isLoading,
     isBuffering: player.isBuffering,
     currentIndex: player.currentIndex,
@@ -67,8 +91,8 @@ export function useVideoSequenceTimelinePlayer({
     offsets: timeline.offsets,
 
     // scrubber / seek helpers
-    isSeeking: player.isSeeking,
-    setIsSeeking: player.setIsSeeking,
+    isSeeking,
+    setIsSeeking,
     seekVirtual,
     queueResumeForCurrentClip: player.queueResumeForCurrentClip,
   };
