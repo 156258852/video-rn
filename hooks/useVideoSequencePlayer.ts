@@ -212,9 +212,13 @@ function appendResumeParam(uri: string, key: number) {
 function shouldPauseActive(phase: Phase, wantPlaying: boolean) {
   switch (phase) {
     case 'idle':
-    case 'ended':
     case 'error':
       return true;
+    case 'ended':
+      // Don't force-pause — native player stops on its own after onEnd.
+      // Force-pausing can freeze the video a few frames before the true
+      // end, cutting off the last fraction of a second of content.
+      return false;
     case 'loading':
       // Keep active slot unpaused while loading to avoid implementations that don't emit load callbacks when paused.
       return false;

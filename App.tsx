@@ -20,7 +20,9 @@ import {useVideoSequenceTimelinePlayer} from './hooks/useVideoSequenceTimelinePl
 import {colors, spacing, radius, typography, shadow} from './theme/qi';
 
 function fmtTime(sec: number): string {
-  if (!Number.isFinite(sec) || sec < 0) sec = 0;
+  if (!Number.isFinite(sec) || sec < 0) {
+    sec = 0;
+  }
   const s = Math.floor(sec % 60);
   const m = Math.floor((sec / 60) % 60);
   const h = Math.floor(sec / 3600);
@@ -33,7 +35,7 @@ export default function App(): React.JSX.Element {
   const [muted, setMuted] = useState(false);
   const log = useCallback((msg: string) => {
     const ts = new Date().toISOString().slice(11, 19);
-    // eslint-disable-next-line no-console
+
     console.log(`[${ts}] ${msg}`);
   }, []);
 
@@ -63,7 +65,8 @@ export default function App(): React.JSX.Element {
     playing,
     setPlaying,
     playingRef,
-    hasCompletedPlayback,
+    playedSecondsRef,
+    sequenceEndCount,
 
     isLoading,
     isBuffering,
@@ -82,7 +85,8 @@ export default function App(): React.JSX.Element {
     urls: mp4Urls,
   });
 
-  const canCompleteMission = hasCompletedPlayback;
+  const canCompleteMission =
+    sequenceEndCount > 0 || (playedSecondsRef.current ?? 0) >= totalSafe * 0.98;
 
   const setPlayingLogged = useCallback(
     (next: boolean, reason: string) => {
@@ -338,7 +342,7 @@ export default function App(): React.JSX.Element {
 
       <View style={styles.missionBody}>
         <Text style={styles.missionH1}>
-          Learn more about your{`\n`}Employee benefit
+          Learn more about your{'\n'}Employee benefit
         </Text>
 
         <View style={styles.pointsRow}>
