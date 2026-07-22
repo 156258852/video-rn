@@ -36,6 +36,9 @@ const MAX_PARALLEL_PRELOADS = 3;
 const DEFAULT_MAX_RETRY_ROUNDS = 3;
 const DEFAULT_PRELOAD_TIMEOUT_MS = 30000;
 
+// Module-level cache: durations survive component remounts (e.g. key changes)
+const durationCache = new Map<string, number>();
+
 const DurationPreloadVideo = ({
   url,
   timeoutMs,
@@ -148,7 +151,7 @@ export function useVideoDurations(
   currentUrlSetRef.current = new Set(urls);
 
   const [durationByUrl, setDurationByUrl] = useState<Record<string, number>>(
-    {},
+    () => Object.fromEntries(durationCache),
   );
 
   const [roundFailedUrls, setRoundFailedUrls] = useState<Set<string>>(
@@ -173,6 +176,7 @@ export function useVideoDurations(
       if (!url || !Number.isFinite(duration) || duration <= 0) {
         return;
       }
+      durationCache.set(url, duration);
 
       setDurationByUrl(prev => {
         if (prev[url] === duration) {
