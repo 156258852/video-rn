@@ -1,0 +1,34 @@
+# 知识卡导出索引文件
+schema_version: 1
+locale: en-US
+branch: main
+nodes_managed: true
+exported_at: "2026-07-26T07:26:59Z"
+modules:
+    "":
+        dir_name: Video Sequence Player & Mission UI
+        title: Video Sequence Player & Mission UI
+        scope:
+            - README.md
+            - .gitignore
+            - .prettierignore
+            - .prettierrc
+            - AGENTS.md
+            - CLAUDE.md
+            - DISCUSSION.md
+            - Gemfile
+            - Gemfile.lock
+            - app.json
+            - babel.config.js
+            - index.js
+            - jest.config.js
+            - metro.config.js
+            - package-lock.json
+            - package.json
+            - tsconfig.json
+            - App.tsx
+            - AIAP-2403.png
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []

@@ -1,0 +1,3 @@
+- Custom hooks are used to encapsulate complex stateful logic (e.g., `useScrubber`, `useVideoSequencePlayer`) keeping the main `App` component clean and declarative.
+- Design tokens from `theme/qi.ts` are imported and applied directly in `StyleSheet.create` calls to ensure UI consistency with the AIA Qi Design System.
+- Video playback state is managed through a combination of refs for mutable values (like `currentTimeRef`) and state for UI-triggering updates (like `playing`), optimizing re-renders.

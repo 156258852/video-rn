@@ -1,0 +1,3 @@
+- Requires a separate Vite dev server running on port 5173 to serve MP4 assets (`npm run dev` in `Stitch_Video_POC`).
+- iOS setup requires CocoaPods: `cd ios && pod install`.
+- Run with Metro: `npx react-native start` then `npx react-native run-ios`.

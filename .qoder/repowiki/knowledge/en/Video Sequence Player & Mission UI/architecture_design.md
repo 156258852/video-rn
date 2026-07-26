@@ -1,0 +1,4 @@
+- Entry point: `App.tsx` orchestrates the UI, combining a static mission screen (`renderMissionScreen`) with a fullscreen modal video player.
+- Core Logic: Delegates complex video sequencing to custom hooks in `hooks/`, specifically `useVideoSequenceTimelinePlayer`, which composes `useVideoSequencePlayer`, `useVideoDurations`, and `useVirtualTimeline` to manage multi-clip playback as a single continuous stream.
+- Theming: Uses a centralized design token system in `theme/qi.ts` for consistent styling (colors, typography, spacing) aligned with the AIA Qi Design System.
+- State Management: Relies on React hooks (`useState`, `useRef`, `useCallback`) for local state, with custom hooks encapsulating side effects like auto-hiding controls (`useAutoHideControls`) and scrubbing logic (`useScrubber`).
