@@ -35,6 +35,8 @@ type SeekOptions = {play?: boolean};
 
 const BUFFER_CONFIG = {cacheSizeMB: 200};
 const MAX_PROGRESS_STEP = 1.5;
+const MAX_ERROR_RETRIES = 3;
+const ERROR_RETRY_DELAY_MS = 3000;
 
 type Slot = 0 | 1;
 type Phase =
@@ -1053,6 +1055,8 @@ export function useVideoSequencePlayer({
   const stateRef = useLatestRef(state);
 
   const playingRef = useLatestRef(state.wantPlaying);
+  const playingBeforeErrorRef = useRef(false);
+  const errorRetryCountRef = useRef(0);
   const currentTimeRef = useRef(0);
   const playedSecondsRef = useRef(0);
 
@@ -1130,6 +1134,50 @@ export function useVideoSequencePlayer({
 
     dispatch({type: 'PRELOAD_SLOT', slot, clipIdx: nextIdx, uri});
   }, [state.activeSlot, state.currentIndex, state.phase, state.slots, urls]);
+
+  // Remember play intent so auto-retry can restore it after recovery.
+  useEffect(() => {
+    if (state.phase !== 'error') {
+      playingBeforeErrorRef.current = state.wantPlaying;
+    }
+  }, [state.phase, state.wantPlaying]);
+
+  // Auto-retry on error: reload the active clip with a cache-busted URL.
+  useEffect(() => {
+    if (state.phase !== 'error') {
+      errorRetryCountRef.current = 0;
+      return;
+    }
+    if (errorRetryCountRef.current >= MAX_ERROR_RETRIES) {
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      const s = stateRef.current;
+      if (s.phase !== 'error') {
+        return;
+      }
+      const idx = s.currentIndex;
+      const baseUri = urls[idx] ?? '';
+      if (!baseUri) {
+        return;
+      }
+
+      errorRetryCountRef.current += 1;
+      resumeKeyRef.current += 1;
+      dispatch({
+        type: 'RELOAD_ACTIVE',
+        idx,
+        time: s.currentTime,
+        newUri: appendResumeParam(baseUri, resumeKeyRef.current),
+      });
+      if (playingBeforeErrorRef.current) {
+        dispatch({type: 'SET_PLAYING', playing: true});
+      }
+    }, ERROR_RETRY_DELAY_MS);
+
+    return () => clearTimeout(timer);
+  }, [state.phase, stateRef, urls]);
 
   const getTotalDuration = useCallback(
     () =>

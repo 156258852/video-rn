@@ -442,6 +442,34 @@ ERROR (active) → errorActivePatch → phase: error
 - `SEEK_WITHIN_CLIP`：seek 当前 clip 以重试
 - `SEEK_TO_CLIP`：切换到其他 clip
 
+### Active slot 错误自动重试（hook 层 effect）
+
+状态机本身是被动的（只响应 native 回调），慢网场景下 AVPlayer 可能因网络超时触发 `onError`，导致永久停在 `error`。为此 hook 层提供了一个 **watchdog effect**，在矩阵之外自动恢复：
+
+```
+phase === 'error'
+    │
+    ├─ 等待 ERROR_RETRY_DELAY_MS (3s)
+    │
+    ├─ 触发时再次确认 phase 仍为 'error'
+    │    （用户期间手动 seek 会离开 error，定时器被 cleanup 取消）
+    │
+    ├─ dispatch RELOAD_ACTIVE（cache-bust URL，从 currentTime 恢复）
+    │    → phase: error → loading
+    │
+    ├─ 若出错前 wantPlaying === true → 追加 dispatch SET_PLAYING(true)
+    │    → 加载成功后自动续播，无需用户手动点播放
+    │
+    └─ 最多重试 MAX_ERROR_RETRIES (3) 次；phase 离开 error 后计数器归零
+```
+
+**设计要点：**
+
+- 转移矩阵零改动 — 只使用 `error` 行已有的 `RELOAD_ACTIVE` 出口
+- 用户操作优先 — error 期间用户 seek 会离开 error phase，effect cleanup 清除定时器，retry 不会与用户手势冲突
+- 播放意图恢复 — `playingBeforeErrorRef` 在非 error 期间持续记录 `wantPlaying`，重试成功后恢复出错前的播放状态
+- 有限重试 — 永久错误（如 URL 失效）最多重试 3 次后停止，不会无限循环
+
 ### Inactive slot 错误
 
 ```
