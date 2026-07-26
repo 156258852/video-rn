@@ -179,6 +179,22 @@ function reducer(state: State, action: Action): State {
 
 ---
 
+### Slot 管理字段
+
+| 字段            | 类型                               | 说明                                                             |
+| --------------- | ---------------------------------- | ---------------------------------------------------------------- |
+| `slots`         | `[SlotInfo\|null, SlotInfo\|null]` | 各 slot 的当前分配信息 `{clipIdx, uri, loadKey}`                 |
+| `slotLoadedKey` | `[number\|null, number\|null]`     | 各 slot 最后一次成功加载时的 loadKey；PRELOAD_SLOT 时重置为 null |
+| `loadKeySeed`   | number                             | 单调递增种子，每次分配 slot 时 +1 生成新 loadKey                 |
+
+**`loadSuccessInactiveRecordGuard` 逻辑：**
+
+- `isValidAssignedEvent` 验证事件的 `{slot, clipIdx, uri, loadKey}` 完全匹配当前 slot 分配
+- `act.slot !== activeSlot` 确保只处理 inactive slot
+- `act.loadKey > (slotLoadedKey[slot] ?? 0)` 单调递增校验，防止重复记录同一事件
+
+---
+
 ## 5. 各 Phase 的转移规则
 
 ### 5.1 `idle`

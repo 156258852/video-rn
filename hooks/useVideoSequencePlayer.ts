@@ -343,7 +343,7 @@ const loadSuccessInactiveRecordGuard = (s: State, a: Action) => {
   return (
     isValidAssignedEvent(s, act.slot, act.clipIdx, act.uri, act.loadKey) &&
     act.slot !== s.activeSlot &&
-    s.slotLoadedKey[act.slot] !== act.loadKey
+    act.loadKey > (s.slotLoadedKey[act.slot] ?? 0)
   );
 };
 const loadSuccessAdvancePendGuard = (s: State, a: Action) =>
@@ -1371,8 +1371,6 @@ export function useVideoSequencePlayer({
               const nextIdx = hasNext ? clipIdx + 1 : null;
               const nextUri = hasNext ? urls[clipIdx + 1] ?? '' : undefined;
 
-              onClipEnd?.({idx: clipIdx, uri, duration: clipDuration});
-
               dispatch({
                 type: 'END',
                 slot,
@@ -1383,6 +1381,8 @@ export function useVideoSequencePlayer({
                 nextIdx,
                 nextUri,
               });
+
+              onClipEnd?.({idx: clipIdx, uri, duration: clipDuration});
             }
           : undefined,
         onBuffer: (e: any) => {

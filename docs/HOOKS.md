@@ -273,8 +273,7 @@ type UseVideoSequencePlayerParams = {
   urls: string[];
   durations: number[];
   recordDuration?: (idx: number, durationSeconds: number) => void;
-
-  isSeeking: boolean; // 外部协调状态：拖动中时忽略 onProgress 回灌
+  onClipEnd?: (payload: {idx: number; uri: string; duration: number}) => void;
 
   // 目前实现中可选（历史遗留/兼容用），本项目实际是由 composition hook 实现 seekVirtual
   getClipForTime?: (t: number) => {idx: number; local: number};
@@ -291,13 +290,28 @@ return {
 
   // 播放控制
   playing: boolean;
-  setPlaying: React.Dispatch<React.SetStateAction<boolean>>;
+  setPlaying: (playing: boolean) => void;
   playingRef: React.RefObject<boolean>;
+
+  // Scrubber 协调
+  isSeeking: boolean;
+  setIsSeeking: (v: boolean) => void;
 
   // 当前索引与时间
   currentIndex: number;
   currentTimeRef: React.RefObject<number>;
-  version: number;
+  times: number[];              // 各 clip 的本地时间缓存
+
+  // 播放进度与完成检测
+  playedSecondsRef: React.RefObject<number>;
+  getTotalDuration: () => number;
+  allDurationsKnown: boolean;
+  sequenceEndCount: number;     // 整序列播完次数
+
+  // 状态指示
+  isLoading: boolean;
+  isBuffering: boolean;
+  error: any;
 
   // 动作
   seekToClip: (idx: number, localSeconds: number, opts?: { play?: boolean }) => void;
