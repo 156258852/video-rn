@@ -1,0 +1,5 @@
+- Complex side effects are encapsulated in custom hooks following the `useXxx` naming convention, keeping `App.tsx` declarative and thin.
+- Mutable values that must survive re-renders without triggering updates are stored in `useRef` (e.g., `currentTimeRef`, `playingRef`, `trackPageXRef`), while UI-driven state uses `useState`.
+- Design tokens from `theme/qi.ts` are imported and applied directly inside `StyleSheet.create` blocks, never hard-coded color or spacing literals.
+- Gesture callbacks read current props/state through `useLatestRef` wrappers so the single `PanResponder` instance always sees up-to-date values without recreation.
+- Hook parameters and return types are declared with explicit TypeScript interfaces/types at the top of each file rather than inline JSDoc.

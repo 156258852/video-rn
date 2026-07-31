@@ -1,1 +1,0 @@
-A React Native proof-of-concept implementing a virtual stitched video timeline player within an AIA employee benefits mission interface.

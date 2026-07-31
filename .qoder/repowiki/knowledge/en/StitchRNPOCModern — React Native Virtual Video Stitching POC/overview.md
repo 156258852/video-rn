@@ -1,0 +1,1 @@
+React Native proof-of-concept that virtually stitches multiple MP4 clips into a single continuous timeline with a custom PanResponder scrubber, rendered inside an AIA employee-benefits mission screen and fullscreen modal player.

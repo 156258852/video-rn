@@ -1,6 +1,6 @@
 schema_version: 1
 module_path: ""
-title: Video Sequence Player & Mission UI
+title: StitchRNPOCModern — React Native Virtual Video Stitching POC
 scope:
     - README.md
     - .gitignore

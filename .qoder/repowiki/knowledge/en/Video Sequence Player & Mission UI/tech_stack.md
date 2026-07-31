@@ -1,1 +1,0 @@
-React Native 0.74.3 with TypeScript, using `react-native-video` for native video playback and `@react-native-community/slider` alternatives implemented via custom PanResponder gestures.

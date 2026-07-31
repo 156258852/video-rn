@@ -1,0 +1,8 @@
+- Entry point `index.js` registers the `App` component via `AppRegistry`, reading the app name from `app.json`.
+- `App.tsx` is the single UI root: it renders a static mission screen (`renderMissionScreen`) plus a `<Modal>` fullscreen video player. All complex state is delegated to custom hooks rather than held in the component.
+- Core playback logic lives under `hooks/` as a layered composition:
+  - `useVideoSequenceTimelinePlayer` composes three sub-hooks — `useVideoDurations` (duration discovery/preload), `useVideoSequencePlayer` (multi-clip `react-native-video` management), and `useVirtualTimeline` (virtual time ↔ clip index mapping) — exposing a unified `seekVirtual` API.
+  - `useScrubber` implements a once-created `PanResponder` backed by refs for gesture state, producing `displayedTime`, `fillW`, `thumbLeft` for the seek bar.
+  - `useAutoHideControls` drives iOS-style auto-hiding of fullscreen controls with `Animated.Value` opacity transitions.
+- Theming is centralized in `theme/qi.ts`, exporting `colors`, `spacing`, `radius`, `typography`, and `shadow` tokens consumed directly in `StyleSheet.create` calls throughout `App.tsx`.
+- Dependency direction is strictly one-way: `App.tsx → hooks/* → utils/useLatestRef`; no hook imports back into the UI layer.
