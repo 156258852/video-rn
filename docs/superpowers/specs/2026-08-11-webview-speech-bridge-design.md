@@ -63,23 +63,23 @@ H5 页面运行在 RN 的 **WKWebView(iOS) / WebView(Android)** 中,这是一个
 
 H5 通过 `window.ReactNativeWebView.postMessage(JSON.stringify(msg))` 发消息。**只能发字符串**,发对象会静默失败。
 
-| msg.type | 触发时机 | payload |
-|---|---|---|
+| msg.type       | 触发时机 | payload                        |
+| -------------- | -------- | ------------------------------ |
 | `speech:start` | 按钮按下 | `{locale: 'zh-CN' \| 'en-US'}` |
-| `speech:stop` | 按钮松开 | 无 |
-| `speech:check` | H5 挂载时探路(可选) | 无 |
+| `speech:stop`  | 按钮松开 | 无                             |
+
+> 注意:没有 `speech:check` 之类的"探路"消息。H5 直接显示按钮,用户按下后如果设备不支持,RN 会回 `error: not-available`,H5 按错误处理即可。少一次 bridge 往返,逻辑更简单。
 
 ### 3.2 RN → H5(推事件)
 
 RN 通过 `webViewRef.injectJavaScript(...)` 调 H5 全局函数 `window.onSpeechEvent(data)`。
 
-| data.type | 触发时机 | data 字段 |
-|---|---|---|
-| `status` | 状态变化 | `{status: 'idle' \| 'requesting-permission' \| 'listening' \| 'error'}` |
-| `interim` | 边说边出字(中间结果) | `{text: '...'}` |
-| `final` | 一句话结束(最终结果) | `{text: '...'}` |
-| `error` | 出错 | `{code: '...', message: '...'}` |
-| `availability` | check 响应 | `{available: true \| false}` |
+| data.type | 触发时机             | data 字段                                                               |
+| --------- | -------------------- | ----------------------------------------------------------------------- |
+| `status`  | 状态变化             | `{status: 'idle' \| 'requesting-permission' \| 'listening' \| 'error'}` |
+| `interim` | 边说边出字(中间结果) | `{text: '...'}`                                                         |
+| `final`   | 一句话结束(最终结果) | `{text: '...'}`                                                         |
+| `error`   | 出错                 | `{code: '...', message: '...'}`                                         |
 
 **为什么拆这么多事件,不直接一个 `result`?**
 
@@ -87,15 +87,15 @@ RN 通过 `webViewRef.injectJavaScript(...)` 调 H5 全局函数 `window.onSpeec
 
 ### 3.3 错误码
 
-| code | 含义 | H5 推荐处理 |
-|---|---|---|
-| `mic-denied` | 麦克风权限被拒 | 显示"去设置"引导 |
-| `speech-denied` | 语音识别权限被拒 | 显示"去设置"引导 |
-| `not-available` | 设备不支持 | 隐藏按钮 / 提示不可用 |
-| `network` | 网络错误(模拟器需联网) | 显示"请检查网络" |
-| `rate-limited` | iOS 调用频率限制 | 显示"请稍后再试" |
-| `max-duration` | 超过 iOS 1 分钟硬限制 | 显示"已达最长录音时长" |
-| `unknown` | 其他 | 显示 message |
+| code            | 含义                   | H5 推荐处理                |
+| --------------- | ---------------------- | -------------------------- |
+| `mic-denied`    | 麦克风权限被拒         | 显示"去设置"引导           |
+| `speech-denied` | 语音识别权限被拒       | 显示"去设置"引导           |
+| `not-available` | 设备不支持             | 显示“此设备不支持语音识别” |
+| `network`       | 网络错误(模拟器需联网) | 显示"请检查网络"           |
+| `rate-limited`  | iOS 调用频率限制       | 显示"请稍后再试"           |
+| `max-duration`  | 超过 iOS 1 分钟硬限制  | 显示"已达最长录音时长"     |
+| `unknown`       | 其他                   | 显示 message               |
 
 ---
 
@@ -105,27 +105,30 @@ RN 通过 `webViewRef.injectJavaScript(...)` 调 H5 全局函数 `window.onSpeec
 
 ```js
 useEffect(() => {
-  window.onSpeechEvent = (data) => {
+  window.onSpeechEvent = data => {
     switch (data.type) {
-      case 'interim':      setDraft(data.text); break;
-      case 'final':        appendFinal(data.text); setDraft(''); break;
-      case 'error':        showError(data.message); break;
-      case 'status':       setStatus(data.status); break;
-      case 'availability': setAvailable(data.available); break;
+      case 'interim':
+        setDraft(data.text);
+        break;
+      case 'final':
+        appendFinal(data.text);
+        setDraft('');
+        break;
+      case 'error':
+        showError(data.message);
+        break;
+      case 'status':
+        setStatus(data.status);
+        break;
     }
   };
-
-  // 探路:问 RN 是否支持语音识别
-  window.ReactNativeWebView.postMessage(
-    JSON.stringify({type: 'speech:check'})
-  );
 
   return () => {
     // 卸载时清理,避免内存泄漏
     window.onSpeechEvent = null;
     // 同时发 stop,防止 RN 那边还在录音
     window.ReactNativeWebView.postMessage(
-      JSON.stringify({type: 'speech:stop'})
+      JSON.stringify({type: 'speech:stop'}),
     );
   };
 }, []);
@@ -139,7 +142,6 @@ useEffect(() => {
   onTouchEnd={() => post({type: 'speech:stop'})}
   onMouseDown={...}   // PC 调试用
   onMouseUp={...}
-  disabled={!available}
 >
   {status === 'listening' ? '识别中...' : '按住说话'}
 </button>
@@ -149,12 +151,14 @@ function post(msg) {
 }
 ```
 
+> 按钮**始终显示**,不要做"先探路再决定显隐"。设备不支持的情况,用户按下后会收到 `error: not-available`,按 §4.4 错误处理即可。
+
 ### 4.3 显示识别结果
 
 ```jsx
 <div>
   {finalText}
-  <span style={{color: '#999'}}>{draft}</span>  {/* 中间结果 */}
+  <span style={{color: '#999'}}>{draft}</span> {/* 中间结果 */}
 </div>
 ```
 
@@ -176,7 +180,7 @@ function post(msg) {
 ```jsx
 <WebView
   source={{uri: 'https://your-h5-url'}}
-  onMessage={(e) => {
+  onMessage={e => {
     const msg = JSON.parse(e.nativeEvent.data);
     switch (msg.type) {
       case 'speech:start':
@@ -184,9 +188,6 @@ function post(msg) {
         break;
       case 'speech:stop':
         speech.stop();
-        break;
-      case 'speech:check':
-        pushToH5({type: 'availability', available: speech.isAvailable});
         break;
     }
   }}
@@ -196,7 +197,7 @@ function post(msg) {
 
 ### 5.2 把 hook 事件桥接到 H5
 
-`useSpeechToText` hook 暴露 `text`、`interimText`、`status`、`error`、`isAvailable`。容器组件用 `useEffect` 监听变化,一变就推给 H5:
+`useSpeechToText` hook 暴露 `text`、`interimText`、`status`、`error`、`isAvailable`。容器组件用 `useEffect` 监听前四个变化,一变就推给 H5(`isAvailable` 只在 RN 本地用,不通过 bridge 推):
 
 ```js
 useEffect(() => {
@@ -208,16 +209,19 @@ useEffect(() => {
 }, [status]);
 
 useEffect(() => {
-  if (error) pushToH5({type: 'error', code: error.code, message: error.message});
+  if (error)
+    pushToH5({type: 'error', code: error.code, message: error.message});
 }, [error]);
 ```
 
 ### 5.3 `pushToH5` 实现
 
 ```js
-const pushToH5 = (data) => {
+const pushToH5 = data => {
   webViewRef.current?.injectJavaScript(
-    `window.onSpeechEvent && window.onSpeechEvent(${JSON.stringify(data)}); true;`
+    `window.onSpeechEvent && window.onSpeechEvent(${JSON.stringify(
+      data,
+    )}); true;`,
   );
 };
 ```
@@ -268,9 +272,8 @@ const pushToH5 = (data) => {
 - [ ] 按钮松开 → 发送 `speech:stop`
 - [ ] 收到 `interim` → 显示为草稿(灰色)
 - [ ] 收到 `final` → 累加到定稿,清草稿
-- [ ] 收到 `error` → 按错误码分别提示
+- [ ] 收到 `error` → 按错误码分别提示(包括 `not-available`)
 - [ ] 收到 `status` → 更新按钮状态文案
-- [ ] 挂载时发 `speech:check` 探路
 - [ ] 卸载时清 `window.onSpeechEvent` + 发 `speech:stop`
 - [ ] `pagehide` / `visibilitychange` 发 `speech:stop`
 
@@ -297,13 +300,13 @@ const pushToH5 = (data) => {
 
 ## 9. 取舍记录
 
-| 决策 | 选 | 不选 | 原因 |
-|---|---|---|---|
-| 通信方式 | postMessage + injectJavaScript | URL scheme / WebSocket | 同 App 内 WebView,bridge 足够,无需额外服务 |
-| 控制方 | H5 控制 UI | RN 控制 UI(全屏 Modal) | H5 那边 UI 自由度高,RN 侧代码最少 |
-| 接口风格 | 多事件细分 | 单一 result 事件 | 支持"边说边出字"实时体验 |
-| 权限时机 | 首次 start 时懒加载 | WebView 挂载时预请求 | 避免打扰用户 |
-| ASR 库 | `@dbkable/react-native-speech-to-text` | `expo-speech-recognition` | 后者需装整个 expo SDK,对裸 RN 过重 |
+| 决策     | 选                                     | 不选                      | 原因                                       |
+| -------- | -------------------------------------- | ------------------------- | ------------------------------------------ |
+| 通信方式 | postMessage + injectJavaScript         | URL scheme / WebSocket    | 同 App 内 WebView,bridge 足够,无需额外服务 |
+| 控制方   | H5 控制 UI                             | RN 控制 UI(全屏 Modal)    | H5 那边 UI 自由度高,RN 侧代码最少          |
+| 接口风格 | 多事件细分                             | 单一 result 事件          | 支持"边说边出字"实时体验                   |
+| 权限时机 | 首次 start 时懒加载                    | WebView 挂载时预请求      | 避免打扰用户                               |
+| ASR 库   | `@dbkable/react-native-speech-to-text` | `expo-speech-recognition` | 后者需装整个 expo SDK,对裸 RN 过重         |
 
 ---
 
