@@ -1,0 +1,37 @@
+{
+  "log 变量": {
+    "prefix": ["clg", "clog"],
+    "body": "console.log('${1}:===========>', ${1});$0",
+    "description": "console.log('var', var)"
+  },
+  "log 深度查看对象": {
+    "prefix": "cjs",
+    "body": "console.log('${1}:', JSON.stringify(${1}, null, 2));$0",
+    "description": "深度打印对象，嵌套也能看全"
+  },
+  "warn 变量": {
+    "prefix": "cwa",
+    "body": "console.warn('${1}', ${1});$0",
+    "description": "console.warn('var', var)"
+  },
+  "error 变量": {
+    "prefix": "cer",
+    "body": "console.error('${1}', ${1});$0",
+    "description": "console.error('var', var)"
+  },
+  "table 数组": {
+    "prefix": "ctb",
+    "body": "console.table(${1});$0",
+    "description": "表格形式打印数组"
+  },
+  "计时器配对": {
+    "prefix": "ctm",
+    "body": ["console.time('${1}');", "$0", "console.timeEnd('${1}');"],
+    "description": "time/timeEnd 成对插入，中间写被测代码"
+  },
+  "log 纯消息": {
+    "prefix": "cms",
+    "body": "console.log('${1:message}');$0",
+    "description": "console.log('message')"
+  }
+}
