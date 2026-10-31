@@ -183,6 +183,10 @@ export default function App(): React.JSX.Element {
         onBuffer={onVideoBuffer}
         onError={onVideoError}
         controls={false}
+        // composition 下没有「切段」事件，跨段连续性完全依赖 AVPlayer 的前向缓冲：
+        // RCTVideo.swift:968 → _playerItem.preferredForwardBufferDuration
+        // 0 = 系统自动（旧默认）；这里显式给 10s，让缓冲窗口能覆盖住下一段开头。
+        preferredForwardBufferDuration={10}
         progressUpdateInterval={250}
       />
 
