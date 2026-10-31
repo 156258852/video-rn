@@ -16,7 +16,7 @@ import {
 import Video from 'react-native-video';
 import {useAutoHideControls} from './hooks/useAutoHideControls';
 import {useScrubber} from './hooks/useScrubber';
-import {useVideoSequenceTimelinePlayer} from './hooks/useVideoSequenceTimelinePlayer';
+import {usePlaylistPlayback} from './hooks/usePlaylistPlayback';
 import {colors, spacing, radius, typography, shadow} from './theme/qi';
 
 function fmtTime(sec: number): string {
@@ -57,36 +57,31 @@ export default function App(): React.JSX.Element {
 
   const mp4Urls = useMemo(() => CLIPS.map(c => c.uri), [CLIPS]);
 
+  // 拼接在 iOS 原生侧完成（AVMutableComposition），这里只拿一条连续时间轴
   const {
-    preloadNode,
-    videoSlots,
-    activePlayer,
-
+    videoRef,
+    source: playlistSource,
     playing,
     setPlaying,
     playingRef,
-    playedSecondsRef,
-    sequenceEndCount,
+    hasCompletedPlayback,
 
     isLoading,
-    isBuffering,
+    isBuffering: playlistBuffering,
 
-    currentIndex: mp4Index,
-    currentTimeRef,
+    duration,
+    currentTime,
 
     ready: timelineReady,
-    virtualTime,
-    totalSafe,
-    setIsSeeking,
+    seek,
+    snapshotForRemount,
 
-    seekVirtual,
-    queueResumeForCurrentClip,
-  } = useVideoSequenceTimelinePlayer({
-    urls: mp4Urls,
-  });
+    onLoad: onPlaylistLoad,
+    onProgress: onPlaylistProgress,
+    onEnd: onPlaylistEnd,
+  } = usePlaylistPlayback(mp4Urls);
 
-  const canCompleteMission =
-    sequenceEndCount > 0 || (playedSecondsRef.current ?? 0) >= totalSafe * 0.98;
+  const canCompleteMission = hasCompletedPlayback;
 
   const setPlayingLogged = useCallback(
     (next: boolean, reason: string) => {
@@ -100,23 +95,31 @@ export default function App(): React.JSX.Element {
     log(`STATE playing=${String(playing)}`);
   }, [log, playing]);
 
+  // 调试用：确认传给 <Video> 的 uri 后面确实带了 #playlist=
+  useEffect(() => {
+    const uri: string = playlistSource?.uri ?? '';
+    const markerIdx = uri.indexOf('#playlist=');
+    log(
+      `SOURCE uri=${uri}\nSOURCE hasMarker=${String(
+        markerIdx >= 0,
+      )} playlistLen=${String(markerIdx >= 0 ? uri.length - markerIdx : 0)}`,
+    );
+  }, [log, playlistSource]);
+
   const onScrubCommit = useCallback(
     (t: number, reason: string) => {
-      seekVirtual(t);
+      seek(t);
       setPlayingLogged(true, reason);
-      log(
-        `scrub commit reason=${reason} t=${t.toFixed(3)} -> seekVirtual + play`,
-      );
+      log(`scrub commit reason=${reason} t=${t.toFixed(3)} -> seek + play`);
     },
-    [log, seekVirtual, setPlayingLogged],
+    [log, seek, setPlayingLogged],
   );
 
   const scrubber = useScrubber({
     enabled: timelineReady,
-    total: totalSafe,
-    baseTime: virtualTime,
+    total: duration,
+    baseTime: currentTime,
     onCommit: onScrubCommit,
-    onSeekingChange: setIsSeeking,
   });
 
   const onVideoBuffer = useCallback(
@@ -126,7 +129,7 @@ export default function App(): React.JSX.Element {
     [log],
   );
 
-  const showOverlay = !timelineReady || isLoading || isBuffering;
+  const showOverlay = !timelineReady || isLoading || playlistBuffering;
 
   const onVideoError = useCallback(
     (e: any) => {
@@ -140,23 +143,11 @@ export default function App(): React.JSX.Element {
   // a pending seek so playback resumes at the same spot in the same clip.
   const toggleFullscreen = useCallback(
     (next: boolean) => {
-      let clipIdx = mp4Index;
-      let localT = currentTimeRef.current ?? 0;
-
-      if (next) {
-        const resume = queueResumeForCurrentClip();
-        clipIdx = resume.idx;
-        localT = resume.time;
-      }
-
-      log(
-        `toggleFullscreen next=${String(
-          next,
-        )} clip=${clipIdx} localT=${localT.toFixed(2)}`,
-      );
+      const t = snapshotForRemount();
+      log(`toggleFullscreen next=${String(next)} t=${t.toFixed(2)}`);
       setIsFullscreen(next);
     },
-    [currentTimeRef, log, mp4Index, queueResumeForCurrentClip],
+    [log, snapshotForRemount],
   );
 
   // ---- Fullscreen auto-hide controls (iOS-native-player style) ----
@@ -174,34 +165,26 @@ export default function App(): React.JSX.Element {
 
   const renderVideo = (extraStyle?: any) => (
     <View style={{flex: 1}}>
-      {videoSlots.map((slot, i) => {
-        const isActive = i === activePlayer;
-
-        return (
-          <Video
-            key={i}
-            ref={slot.ref}
-            source={slot.source}
-            paused={slot.paused}
-            muted={muted}
-            style={[
-              StyleSheet.absoluteFill,
-              extraStyle,
-              {
-                opacity: isActive && !isLoading ? 1 : 0,
-                zIndex: isActive ? 2 : 1,
-              },
-            ]}
-            resizeMode="contain"
-            onLoad={slot.onLoad}
-            onProgress={slot.onProgress}
-            onEnd={slot.onEnd}
-            onBuffer={slot.onBuffer ?? onVideoBuffer}
-            onError={onVideoError}
-            controls={false}
-          />
-        );
-      })}
+      {/* 单个播放器：整条时间轴由 iOS 原生合成，这里只负责显示与交互 */}
+      <Video
+        ref={videoRef}
+        source={playlistSource}
+        paused={!playing}
+        muted={muted}
+        style={[
+          StyleSheet.absoluteFill,
+          extraStyle,
+          {opacity: isLoading ? 0 : 1},
+        ]}
+        resizeMode="contain"
+        onLoad={onPlaylistLoad}
+        onProgress={onPlaylistProgress}
+        onEnd={onPlaylistEnd}
+        onBuffer={onVideoBuffer}
+        onError={onVideoError}
+        controls={false}
+        progressUpdateInterval={250}
+      />
 
       {/* Loading overlay: black bg + spinner, covers all video slots */}
       {showOverlay && (
@@ -243,7 +226,7 @@ export default function App(): React.JSX.Element {
     </SafeAreaView>
   );
 
-  const uiTotal = useMemo(() => totalSafe, [totalSafe]);
+  const uiTotal = useMemo(() => duration, [duration]);
 
   const renderFsCenterControls = () => (
     <View style={styles.fsCenterRow} pointerEvents="box-none">
@@ -251,7 +234,7 @@ export default function App(): React.JSX.Element {
         style={styles.fsCenterBtn}
         onPress={() => {
           showFsControls();
-          seekVirtual(Math.max(0, virtualTime - 10));
+          seek(Math.max(0, currentTime - 10));
         }}>
         <Text style={styles.fsCenterSkipText}>10</Text>
         <Text style={styles.fsCenterArrowL}>⟲</Text>
@@ -271,7 +254,7 @@ export default function App(): React.JSX.Element {
         style={styles.fsCenterBtn}
         onPress={() => {
           showFsControls();
-          seekVirtual(Math.min(uiTotal, virtualTime + 10));
+          seek(Math.min(uiTotal, currentTime + 10));
         }}>
         <Text style={styles.fsCenterSkipText}>10</Text>
         <Text style={styles.fsCenterArrowR}>⟳</Text>
@@ -420,7 +403,6 @@ export default function App(): React.JSX.Element {
   return (
     <>
       <StatusBar barStyle="dark-content" />
-      {preloadNode}
       <SafeAreaView style={styles.safe}>
         <ScrollView contentContainerStyle={styles.missionScroll}>
           {renderMissionScreen()}

@@ -1,0 +1,63 @@
+# Resolve react_native_pods.rb with node to allow for hoisting
+require Pod::Executable.execute_command('node', ['-p',
+  'require.resolve(
+    "react-native/scripts/react_native_pods.rb",
+    {paths: [process.argv[1]]},
+  )', __dir__]).strip
+
+# RN 0.74 的 min_ios_version_supported 返回 13.4，而 Xcode 27 最低只支持 15.0，
+# 不改会在 pod 的每个 target 上报 "range of supported deployment target versions is 15.0 to 27.0.x"
+platform :ios, '15.0'
+prepare_react_native_project!
+cd /Users/lhy/Desktop/code/FEDemo/video-rn/ios && \
+UDID=CB3B27D5-144E-44C0-B8D3-06E05BA432BE && \
+xcodebuild -workspace StitchRNPOCModern.xcworkspace -scheme StitchRNPOCModern \
+  -configuration Debug -sdk iphonesimulator -destination "id=$UDID" \
+  -derivedDataPath build/DerivedData build 2>&1 | grep -E "error:|BUILD " && \
+APP=$(find /Users/lhy/Desktop/code/FEDemo/video-rn/ios/build/DerivedData -name "StitchRNPOCModern.app" -type d | head -1) && \
+xcrun simctl install $UDID "$APP" && \
+xcrun simctl launch $UDID $(defaults read "$APP/Info" CFBundleIdentifier)
+
+linkage = ENV['USE_FRAMEWORKS']
+if linkage != nil
+  Pod::UI.puts "Configuring Pod with #{linkage}ally linked Frameworks".green
+  use_frameworks! :linkage => linkage.to_sym
+end
+
+target 'StitchRNPOCModern' do
+  config = use_native_modules!
+
+  use_react_native!(
+    :path => config[:reactNativePath],
+    # An absolute path to your application root.
+    :app_path => "#{Pod::Config.instance.installation_root}/.."
+  )
+
+  target 'StitchRNPOCModernTests' do
+    inherit! :complete
+    # Pods for testing
+  end
+
+  post_install do |installer|
+    # https://github.com/facebook/react-native/blob/main/packages/react-native/scripts/react_native_pods.rb#L197-L202
+    react_native_post_install(
+      installer,
+      config[:reactNativePath],
+      :mac_catalyst_enabled => false,
+      # :ccache_enabled => true
+    )
+
+    # RN 的 react_native_post_install 会把所有 pod target 的部署目标写回
+    # min_ios_version_supported（RN 0.74 = 13.4），而 Xcode 27 最低只认 15.0。
+    # 必须在它之后统一覆盖，否则 Pods 工程全部报
+    # "range of supported deployment target versions is 15.0 to 27.0.x"
+    installer.pods_project.build_configurations.each do |config|
+      config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '15.0'
+    end
+    installer.pods_project.targets.each do |target|
+      target.build_configurations.each do |config|
+        config.build_settings['IPHONEOS_DEPLOYMENT_TARGET'] = '15.0'
+      end
+    end
+  end
+end
