@@ -6,6 +6,9 @@ buildscript {
         targetSdkVersion = 34
         ndkVersion = "26.1.10909125"
         kotlinVersion = "1.9.22"
+        // 与 node_modules/react-native-video/android/gradle.properties 里的
+        // RNVideo_media3Version 保持一致，避免出现两份 media3
+        media3Version = "1.8.0"
     }
     repositories {
         google()

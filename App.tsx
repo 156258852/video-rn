@@ -6,6 +6,7 @@ import {
   View,
   Text,
   StatusBar,
+  Platform,
   TouchableOpacity,
   Pressable,
   ScrollView,
@@ -170,7 +171,7 @@ export default function App(): React.JSX.Element {
         ref={videoRef}
         source={playlistSource}
         paused={!playing}
-        muted={muted}
+        muted={false}
         style={[
           StyleSheet.absoluteFill,
           extraStyle,
@@ -201,6 +202,11 @@ export default function App(): React.JSX.Element {
           />
         </View>
       )}
+
+      {/* Android: 原生 ExoPlayerView 会消费触摸事件，父级 Pressable 的
+          onPress 收不到，导致点击画面唤不出控制条。放一层透明点击层
+          在最上面接管 tap（iOS 上无影响，仍走同一回调） */}
+      <Pressable style={StyleSheet.absoluteFill} onPress={onFsVideoTap} />
     </View>
   );
 
@@ -478,7 +484,10 @@ const styles = StyleSheet.create({
   missionScreen: {flex: 1, backgroundColor: colors.surface.page},
 
   topNav: {
-    height: 52,
+    // RN 的 SafeAreaView 在 Android 上不生效，topNav 会顶到状态栏底下被盖住，
+    // 这里显式让出状态栏高度（iOS 由 SafeAreaView 处理）
+    height: 52 + (Platform.OS === 'android' ? StatusBar.currentHeight ?? 0 : 0),
+    paddingTop: Platform.OS === 'android' ? StatusBar.currentHeight ?? 0 : 0,
     flexDirection: 'row',
     alignItems: 'center',
     paddingHorizontal: spacing.s8,

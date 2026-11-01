@@ -113,6 +113,11 @@ dependencies {
     } else {
         implementation jscFlavor
     }
+
+    // playlist 插件需要直接引用 media3 类；
+    // react-native-video 内部是 implementation 声明，不会传递过来，所以这里显式加一次
+    implementation "androidx.media3:media3-exoplayer:${rootProject.ext.media3Version}"
+    implementation "androidx.media3:media3-common:${rootProject.ext.media3Version}"
 }
 
 apply from: file("../../node_modules/@react-native-community/cli-platform-android/native_modules.gradle"); applyNativeModulesAppBuildGradle(project)

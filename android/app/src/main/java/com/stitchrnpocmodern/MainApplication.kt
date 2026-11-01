@@ -1,6 +1,7 @@
 package com.stitchrnpocmodern
 
 import android.app.Application
+import com.brentvatne.react.ReactNativeVideoManager
 import com.facebook.react.PackageList
 import com.facebook.react.ReactApplication
 import com.facebook.react.ReactHost
@@ -10,6 +11,7 @@ import com.facebook.react.defaults.DefaultNewArchitectureEntryPoint.load
 import com.facebook.react.defaults.DefaultReactHost.getDefaultReactHost
 import com.facebook.react.defaults.DefaultReactNativeHost
 import com.facebook.soloader.SoLoader
+import com.stitchrnpocmodern.video.PlaylistComposerPlugin
 
 class MainApplication : Application(), ReactApplication {
 
@@ -36,8 +38,11 @@ class MainApplication : Application(), ReactApplication {
     super.onCreate()
     SoLoader.init(this, false)
     if (BuildConfig.IS_NEW_ARCHITECTURE_ENABLED) {
-      // If you opted-in for the New Architecture, we load the native entry point for this app.
+      // You opted-in for the New Architecture, we load the native entry point for this app.
       load()
     }
+
+    // 注册 video 插件：把带 #playlist= 的 uri 在原生侧拼成一条连续时间轴
+    ReactNativeVideoManager.getInstance().registerPlugin(PlaylistComposerPlugin())
   }
 }

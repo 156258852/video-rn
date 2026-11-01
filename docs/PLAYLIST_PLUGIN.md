@@ -1,8 +1,13 @@
-# iOS 原生拼接播放列表：PlaylistComposerPlugin
+# 原生拼接播放列表：PlaylistComposerPlugin（iOS + Android 双端）
 
-把「多段 MP4 虚拟拼接成一条连续时间轴」这件事从 RN 侧搬到 iOS 原生侧。
+把「多段 MP4 虚拟拼接成一条连续时间轴」这件事从 RN 侧搬到原生侧。**iOS 用 `AVMutableComposition`，Android 用 `ConcatenatingMediaSource2`**。
 
 **职责边界**：原生只负责播，交互 UI（进度条、全屏、按钮、完成度判定）仍然由 RN 自绘。
+
+> **双端一套 JS 代码**：JS 侧完全不区分平台——同一个 `hooks/usePlaylistPlayback.ts`、同一份 `App.tsx`、
+> 同一条 `${urls[0]}#playlist=${encodedUrls}` 传参协议。差异全部收在原生插件里
+> （`ios/StitchRNPOCModern/PlaylistComposerPlugin.swift` / `android/.../video/PlaylistComposerPlugin.kt`），
+> 两端各自实现各自的 plugin 接口，对 RN 暴露的行为一致。
 
 ## 目录
 
@@ -16,6 +21,15 @@
 8. [编译 / 安装 / 日志（Xcode 27 命令行路线）](#8-编译--安装--日志xcode-27-命令行路线)
 9. [已知问题与后续](#9-已知问题与后续) — 含[两个编译坑](#9-已知问题与后续)、[iOS 版本兼容](#9-已知问题与后续)
 10. [回退](#10-回退)
+
+### Android 部分
+
+11. [Android 原理与钩子位置](#11-android-原理与钩子位置)
+12. [Android 插件完整代码](#12-android-插件完整代码)
+13. [Android 怎么接入](#13-android-怎么接入)
+14. [Android 编译配置（compileSdk / media3）](#14-android-编译配置compilesdk--media3)
+15. [Android 踩过的坑](#15-android-踩过的坑)
+16. [双端差异对照](#16-双端差异对照)
 
 ---
 
@@ -793,4 +807,413 @@ SOURCE hasMarker=true playlistLen=278
 +import {useVideoSequenceTimelinePlayer} from './hooks/useVideoSequenceTimelinePlayer';
 ```
 
-要彻底移除原生侧：删 `ios/StitchRNPOCModern/PlaylistComposerPlugin.swift`、`AppDelegate.mm` 里的注册块、pbxproj 里那三处引用。
+要彻底移除原生侧：
+
+- iOS：删 `ios/StitchRNPOCModern/PlaylistComposerPlugin.swift`、`AppDelegate.mm` 里的注册块、pbxproj 里那三处引用。
+- Android：删 `android/app/src/main/java/com/stitchrnpocmodern/video/PlaylistComposerPlugin.kt`、
+  `MainApplication.kt` 里的 `registerPlugin(...)` 一行，以及 `app/build.gradle` 里显式加的 media3 依赖
+  （`android/build.gradle` 的 `ext.media3Version` 可以留着，无副作用）。
+
+> 旧的双播放器方案（`hooks/useVideoSequencePlayer.ts`、`useVideoSequenceTimelinePlayer.ts`、
+> `useVirtualTimeline.ts`、`useVideoDurations.tsx`）**保留未删**，随时可以切回去对比或回退。
+
+---
+---
+
+# Android 部分
+
+## 11. Android 原理与钩子位置
+
+react-native-video 6.19.2 在 Android 侧同样自带插件钩子，**不用 fork 库、不用写 bridge 模块**：
+
+```
+node_modules/react-native-video/android/src/main/java/com/brentvatne/exoplayer/RNVExoplayerPlugin.kt:49
+  fun overrideMediaSourceFactory(source, mediaSourceFactory, mediaDataSourceFactory): MediaSource.Factory?
+        ↑ 返回非 null 就用你的 factory，null 走默认
+
+node_modules/.../com/brentvatne/react/ReactNativeVideoManager.kt:56 / 103-111
+  registerPlugin(plugin)  →  遍历插件问 overrideMediaSourceFactory
+
+node_modules/.../com/brentvatne/exoplayer/ReactExoplayerView.java:1104-1130
+  按 uri 推断 contentType，构造 ProgressiveMediaSource.Factory 等
+  :1134  ReactNativeVideoManager.getInstance().overrideMediaSourceFactory(...)  ← 插件在这里被问
+  :1152  mediaSourceFactory.createMediaSource(mediaItem)
+```
+
+**uri 带 fragment 会不会影响类型推断？不会。** Android 的 `Uri.parse()` 把 `#playlist=...` 解析成独立的 fragment，
+`uri.getLastPathSegment()` 仍然是 `ThaiKongfu.mp4`，所以 `Util.inferContentType(...)`（`ReactExoplayerView.java:1012`）
+照旧得到 `CONTENT_TYPE_OTHER` → `ProgressiveMediaSource.Factory`，正好能走到我们的 override。
+
+**为什么用 `ConcatenatingMediaSource2`**：media3 里老的 `ConcatenatingMediaSource`（动态版）已移除；
+`ConcatenatingMediaSource2` 会把多段合并成**单个 window 的单条 Timeline**，
+和 iOS 的 `AVMutableComposition` 效果一致：`duration` 是总时长、`currentTime` 是全局时间、`seek(t)` 直接全局。
+
+守卫逻辑与 iOS 完全一致：
+
+| 条件 | 行为 |
+|---|---|
+| uri 里没有 `#playlist=` | 返回 `null`，react-native-video 走自己的默认路径 |
+| 只有 1 段 | 返回 `null`（没必要拼） |
+| ≥ 2 段 | 返回自定义 `PlaylistMediaSourceFactory` |
+
+---
+
+## 12. Android 插件完整代码
+
+`android/app/src/main/java/com/stitchrnpocmodern/video/PlaylistComposerPlugin.kt`：
+
+```kotlin
+package com.stitchrnpocmodern.video
+
+import android.media.MediaMetadataRetriever
+import android.util.Log
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.datasource.DataSource
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.drm.DrmSessionManagerProvider
+import androidx.media3.exoplayer.source.ConcatenatingMediaSource2
+import androidx.media3.exoplayer.source.MediaSource
+import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy
+import com.brentvatne.common.api.Source
+import com.brentvatne.exoplayer.RNVExoplayerPlugin
+import java.net.URLDecoder
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+
+class PlaylistComposerPlugin : RNVExoplayerPlugin {
+
+    companion object {
+        private const val TAG = "PlaylistComposerPlugin"
+        private const val MARKER = "#playlist="
+
+        // 默认占位时长：还没探测到真实时长时先用它，prepare 完会被真实值替换
+        private const val DEFAULT_PLACEHOLDER_MS = 1_000L
+
+        // url -> 真实时长(ms)：后台探测一次后缓存，后续同 url 一上来就是完整总时长
+        private val durationCache = ConcurrentHashMap<String, Long>()
+        private val probeExecutor = Executors.newSingleThreadExecutor()
+
+        private fun probeDurationAsync(url: String) {
+            probeExecutor.execute {
+                if (durationCache.containsKey(url)) return@execute
+                val retriever = MediaMetadataRetriever()
+                try {
+                    retriever.setDataSource(url, emptyMap())
+                    val durationMs = retriever
+                        .extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                        ?.toLongOrNull()
+                    if (durationMs != null && durationMs > 0) {
+                        durationCache[url] = durationMs
+                        Log.d(TAG, "probe duration ok: ${durationMs}ms $url")
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "probe duration failed: $url ${e.message}")
+                } finally {
+                    retriever.release()
+                }
+            }
+        }
+    }
+
+    override fun overrideMediaSourceFactory(
+        source: Source,
+        mediaSourceFactory: MediaSource.Factory,
+        mediaDataSourceFactory: DataSource.Factory
+    ): MediaSource.Factory? {
+        val rawUri = source.uri?.toString()
+        if (rawUri.isNullOrEmpty()) return null
+
+        val markerIdx = rawUri.indexOf(MARKER)
+        if (markerIdx < 0) {
+            Log.d(TAG, "no playlist marker, use default factory")   // 普通视频：不干预
+            return null
+        }
+
+        val playlistParam = rawUri.substring(markerIdx + MARKER.length)
+        val urls = playlistParam
+            .split(',')
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .map { URLDecoder.decode(it, "UTF-8") }
+
+        if (urls.size <= 1) return null
+
+        // 没缓存过的 url 后台探测一次，下次再播就能一上来拿到完整时长
+        urls.forEach { url ->
+            if (!durationCache.containsKey(url)) probeDurationAsync(url)
+        }
+
+        Log.d(TAG, "build concatenated source with ${urls.size} items")
+        urls.forEachIndexed { i, u -> Log.d(TAG, "  [$i] $u") }
+
+        return PlaylistMediaSourceFactory(urls, mediaSourceFactory)
+    }
+
+    override fun onInstanceCreated(id: String, player: ExoPlayer) {
+        Log.d(TAG, "onInstanceCreated id=$id")
+    }
+
+    override fun onInstanceRemoved(id: String, player: ExoPlayer) {
+        Log.d(TAG, "onInstanceRemoved id=$id")
+    }
+
+    /**
+     * 子 source 复用 react-native-video 传下来的默认 factory 创建，
+     * 这样缓存（RNVSimpleCache）、DRM、重试策略等配置都能继承下来。
+     */
+    private class PlaylistMediaSourceFactory(
+        private val urls: List<String>,
+        private val defaultFactory: MediaSource.Factory
+    ) : MediaSource.Factory {
+
+        override fun setDrmSessionManagerProvider(
+            drmSessionManagerProvider: DrmSessionManagerProvider
+        ): MediaSource.Factory {
+            defaultFactory.setDrmSessionManagerProvider(drmSessionManagerProvider)
+            return this
+        }
+
+        override fun setLoadErrorHandlingPolicy(
+            loadErrorHandlingPolicy: LoadErrorHandlingPolicy
+        ): MediaSource.Factory {
+            defaultFactory.setLoadErrorHandlingPolicy(loadErrorHandlingPolicy)
+            return this
+        }
+
+        override fun getSupportedTypes(): IntArray = intArrayOf(C.CONTENT_TYPE_OTHER)
+
+        override fun createMediaSource(mediaItem: MediaItem): MediaSource {
+            val builder = ConcatenatingMediaSource2.Builder()
+            urls.forEach { url ->
+                val child = defaultFactory.createMediaSource(MediaItem.fromUri(url))
+                // media3 1.8 要求 ProgressiveMediaSource 必须给占位时长；
+                // 有探测缓存就用真实时长，否则用默认值，prepare 完由真实值替换
+                val placeholderMs = durationCache[url] ?: DEFAULT_PLACEHOLDER_MS
+                builder.add(child, placeholderMs)
+            }
+            return builder.build()
+        }
+    }
+}
+```
+
+---
+
+## 13. Android 怎么接入
+
+**① 注册插件** — `android/app/src/main/java/com/stitchrnpocmodern/MainApplication.kt`
+
+```diff
+ import android.app.Application
++import com.brentvatne.react.ReactNativeVideoManager
+ import com.facebook.react.PackageList
+ ...
+ import com.facebook.soloader.SoLoader
++import com.stitchrnpocmodern.video.PlaylistComposerPlugin
+
+   override fun onCreate() {
+     super.onCreate()
+     SoLoader.init(this, false)
+     if (BuildConfig.IS_NEW_ARCHITECTURE_ENABLED) {
+       load()
+     }
++
++    // 注册 video 插件：把带 #playlist= 的 uri 在原生侧拼成一条连续时间轴
++    ReactNativeVideoManager.getInstance().registerPlugin(PlaylistComposerPlugin())
+   }
+```
+
+**② 编译 & 安装**
+
+```bash
+yarn android        # = react-native run-android（编译 + 装 + 启动）
+
+# 或者手动（build 与安装分开，方便看日志）
+cd android && ./gradlew :app:assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb shell am start -n com.stitchrnpocmodern/.MainActivity
+```
+
+**③ 看日志**
+
+```bash
+adb logcat | grep -E "PlaylistComposerPlugin|ReactNativeJS"
+```
+
+正常情况下会看到：
+
+```
+PlaylistComposerPlugin: build concatenated source with 3 items
+PlaylistComposerPlugin:   [0] https://.../ThaiKongfu.mp4
+PlaylistComposerPlugin:   [1] https://media.w3.org/2010/05/sintel/trailer.mp4
+PlaylistComposerPlugin:   [2] https://.../xgplayer-demo-360p.mp4
+PlaylistComposerPlugin: probe duration ok: 25025ms https://.../ThaiKongfu.mp4
+```
+
+---
+
+## 14. Android 编译配置（compileSdk / media3）
+
+**① compileSdk 必须 ≥ 35**（media3 1.8.0 的硬性要求）
+
+```
+FAILURE: Build failed with an exception.
+> Execution failed for task ':app:checkDebugAarMetadata'.
+   > 13 issues were found when checking AAR metadata:
+     Dependency 'androidx.media3:media3-exoplayer:1.8.0' requires libraries and applications that
+     depend on it to compile against version 35 or later of the Android APIs.
+     :app is currently compiled against android-34.
+```
+
+`android/build.gradle`：
+
+```diff
+-        compileSdkVersion = 34
++        compileSdkVersion = 35
+         targetSdkVersion = 34        # 保持 34：运行时行为不变，只动编译期
+```
+
+`android/gradle.properties`（AGP 8.2.1 官方"建议"最高 34，用 35 只会有 warning，压掉）：
+
+```diff
+ android.useAndroidX=true
++android.suppressUnsupportedCompileSdk=35
+```
+
+> 模拟器是 **API 36** 也完全没关系：模拟器系统镜像版本和 compileSdk 是两回事，APK 向前兼容。
+> 之前担心的"缺 android-34 platform"反而不存在了（35/36 都已安装）。
+
+**② media3 依赖要显式加一次**
+
+react-native-video 内部用的是 `implementation`，不会传递给我们 app 模块，插件里直接 import media3 类会找不到：
+
+```diff
+ # android/app/build.gradle
+ dependencies {
+     ...
++    // playlist 插件需要直接引用 media3 类；
++    // react-native-video 内部是 implementation 声明，不会传递过来
++    implementation "androidx.media3:media3-exoplayer:${rootProject.ext.media3Version}"
++    implementation "androidx.media3:media3-common:${rootProject.ext.media3Version}"
+ }
+```
+
+```diff
+ # android/build.gradle (ext)
++        // 与 node_modules/react-native-video/android/gradle.properties 里的
++        // RNVideo_media3Version 保持一致，避免出现两份 media3
++        media3Version = "1.8.0"
+```
+
+**③ .gitignore 别把 android/ 整个忽略**
+
+之前 `.gitignore` 里有一行 `android/`，导致 27 个 android 源文件一个都没入库。现在是精确忽略：
+
+```gitignore
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties   # 本机 SDK 路径，绝不能入库
+android/.idea/
+android/captures/
+*.keystore
+!debug.keystore            # RN 的 debug 签名是公开的，按惯例入库
+```
+
+---
+
+## 15. Android 踩过的坑
+
+**① `Progressive media source must define an initial placeholder duration`**
+
+```
+java.lang.IllegalStateException: Progressive media source must define an initial placeholder duration.
+  at androidx.media3.common.util.Assertions.checkState(Assertions.java:100)
+  at androidx.media3.exoplayer.source.ConcatenatingMediaSource2$Builder.add(...:206)
+```
+
+media3 1.8 的 `Builder.add(MediaSource)` 内部是 `add(source, C.TIME_UNSET)`，对 `ProgressiveMediaSource`
+会直接抛异常。必须显式给占位时长：`builder.add(child, placeholderMs)`。
+占位值只在"真实时长还没算出来"时用，prepare 完自动被真实值替换。
+
+**② 控制条点不出来（不是 z-index 层级问题）**
+
+现象：Android 全屏播放时点画面，控制条不出现（iOS 正常）。
+
+根因：原生 `ExoPlayerView`（SurfaceView 容器）会消费触摸事件，父级 `Pressable` 的 `onPress` 根本收不到。
+
+修法：在视频之上加一层透明点击层接管 tap（`App.tsx` 的 `renderVideo`）：
+
+```tsx
+{/* Android: 原生 ExoPlayerView 会消费触摸事件，父级 Pressable 的 onPress 收不到 */}
+<Pressable style={StyleSheet.absoluteFill} onPress={onFsVideoTap} />
+```
+
+**③ 时间轴只有第一段的时长**
+
+现象：开播瞬间总时长只有第 1 段（26s），而不是三段之和（167s）。
+
+根因：iOS 的 `AVMutableComposition` 是**同步拼接**（插轨前必须把每段时长加载完）；
+Android 的 `ConcatenatingMediaSource2` 是**懒 prepare**，第 1 段就绪就开播，后两段还在后台下载解析，
+`player.getDuration()` 只能慢慢长出来，而 JS 原先只在 `onLoad` 取一次时长。
+
+现在的解法（**原生为主，JS 为可选兜底**）：
+
+| 层 | 做法 |
+|---|---|
+| 原生 | `MediaMetadataRetriever` 后台探测每段真实时长 + 按 url 缓存；有缓存时用真实时长做占位时长 |
+| JS（可选） | `onProgress` 里的 `seekableDuration`（= `player.getDuration()` 最新值）持续补正 |
+
+实测：探测结果 `25025 + 52209 + 90080 = 167314ms`；首次播放（缓存冷）几秒内从 26s 补正到 167s，
+**第二次播放起 `onLoad` 直接就是完整的 167s**。
+
+> 注意：JS 兜底那几行（`hooks/usePlaylistPlayback.ts`）**已被还原**，
+> 所以现在缓存冷的那一次会把偏小的时长一直显示到 remount（退出全屏再进就正确）。
+
+**④ `duration=0` 时误判"已完成"**
+
+`hasCompletedPlayback = watchedSecondsRef.current >= duration * 0.98`，
+刚启动还没加载出时间轴时 `duration = 0`，`0 >= 0` 成立 → 一进来就是绿勾、Complete 可点。
+
+修法（1 行，JS 侧）：
+
+```diff
+-  const hasCompletedPlayback =
+-    endedRef.current || watchedSecondsRef.current >= duration * 0.98;
++  const hasCompletedPlayback =
++    ready && (endedRef.current || watchedSecondsRef.current >= duration * 0.98);
+```
+
+> 这行也随上一节的还原一并回退了，如需修就单独补这一行。
+
+**⑤ 模拟器没声音（环境问题，不是代码问题）**
+
+应用侧一直在写 PCM，但模拟器音频 HAL 写宿主失败：
+
+```
+android.hardware.audio@7.1-impl.ranchu: pcmWrite:259
+pcm_writei failed with 'cannot read/write stream data: I/O error' (-1)
+```
+
+`kill` 掉 `audioserver` 重启后暂停期间无报错、恢复播放又出现 → 与播放强相关，确认是模拟器/宿主音频设备问题。
+处理：AVD **Cold Boot Now**、检查 Mac 的声音输出设备、或真机复核。代码不用动。
+
+---
+
+## 16. 双端差异对照
+
+| | iOS | Android |
+|---|---|---|
+| 拼接对象 | `AVMutableComposition` | `ConcatenatingMediaSource2` |
+| 插件接口 | `RNVAVPlayerPlugin.overridePlayerAsset` | `RNVExoplayerPlugin.overrideMediaSourceFactory` |
+| 注册位置 | `AppDelegate.mm`（`NSClassFromString` + `performSelector`） | `MainApplication.kt`（`ReactNativeVideoManager.registerPlugin`） |
+| JS 传参 | 同一套 `${urls[0]}#playlist=${encodedUrls}` | 同一套 |
+| JS 代码 | 同一个 `usePlaylistPlayback.ts` + 同一个 `App.tsx`，**不区分平台** | 同一个 |
+| 拼接时机 | 同步（时长一开始就准） | 懒 prepare（时长逐渐变准，原生探测缓存兜底） |
+| 跨段事件 | 无（composition 里没有切段回调） | 无（单 window），但 `player.currentMediaItemIndex` 可拿到段号 |
+| 预加载下一段 | 不需要，靠 AVPlayer 前向缓冲（`preferredForwardBufferDuration`） | 不需要，靠 ExoPlayer 自身的缓冲窗口 |
+| `bufferConfig` | iOS 忽略 | Android 有效 |
+| 控制条点击 | 父级 `Pressable` 能收到 | 需额外透明点击层（原生视图会消费触摸） |
+
+**一句话**：JS 侧是一套代码、一个播放器、一条时间轴；两端的差别只有原生插件实现 + 上面这几条行为差异。
