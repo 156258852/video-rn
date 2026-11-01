@@ -12,9 +12,20 @@ ios/Pods/
 # 构建产物
 # ============================================================
 build/
-android/
 ios/build/
 ios/DerivedData/
+
+# ============================================================
+# Android：源码入库，只忽略构建产物和本机配置
+# ============================================================
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+android/captures/
+*.keystore
+!debug.keystore
 
 # ============================================================
 # Xcode 用户态 / 本地环境
