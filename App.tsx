@@ -18,6 +18,7 @@ import Video from 'react-native-video';
 import {useAutoHideControls} from './hooks/useAutoHideControls';
 import {useScrubber} from './hooks/useScrubber';
 import {usePlaylistPlayback} from './hooks/usePlaylistPlayback';
+import NativePlaylistPlayer from './components/NativePlaylistPlayer';
 import {colors, spacing, radius, typography, shadow} from './theme/qi';
 
 function fmtTime(sec: number): string {
@@ -164,32 +165,54 @@ export default function App(): React.JSX.Element {
   const showFsControls = fsControls.show;
   const onFsVideoTap = fsControls.onTap;
 
+  const useNativePlayer = Platform.OS === 'ios';
+
   const renderVideo = (extraStyle?: any) => (
     <View style={{flex: 1}}>
-      {/* 单个播放器：整条时间轴由 iOS 原生合成，这里只负责显示与交互 */}
-      <Video
-        ref={videoRef}
-        source={playlistSource}
-        paused={!playing}
-        muted={false}
-        style={[
-          StyleSheet.absoluteFill,
-          extraStyle,
-          {opacity: isLoading ? 0 : 1},
-        ]}
-        resizeMode="contain"
-        onLoad={onPlaylistLoad}
-        onProgress={onPlaylistProgress}
-        onEnd={onPlaylistEnd}
-        onBuffer={onVideoBuffer}
-        onError={onVideoError}
-        controls={false}
-        // composition 下没有「切段」事件，跨段连续性完全依赖 AVPlayer 的前向缓冲：
-        // RCTVideo.swift:968 → _playerItem.preferredForwardBufferDuration
-        // 0 = 系统自动（旧默认）；这里显式给 10s，让缓冲窗口能覆盖住下一段开头。
-        preferredForwardBufferDuration={10}
-        progressUpdateInterval={250}
-      />
+      {useNativePlayer ? (
+        // iOS：原生播放列表播放器（AVQueuePlayer 顺序播 + 原生算全局时间）
+        <NativePlaylistPlayer
+          ref={videoRef}
+          sources={mp4Urls}
+          paused={!playing}
+          muted={muted}
+          style={[
+            StyleSheet.absoluteFill,
+            extraStyle,
+            {opacity: isLoading ? 0 : 1},
+          ]}
+          onLoad={onPlaylistLoad}
+          onProgress={onPlaylistProgress}
+          onEnd={onPlaylistEnd}
+          onBuffer={onVideoBuffer}
+          onError={onVideoError}
+        />
+      ) : (
+        // Android：暂时仍走 react-native-video + 拼接插件
+        <Video
+          ref={videoRef}
+          source={playlistSource}
+          paused={!playing}
+          muted={false}
+          style={[
+            StyleSheet.absoluteFill,
+            extraStyle,
+            {opacity: isLoading ? 0 : 1},
+          ]}
+          resizeMode="contain"
+          onLoad={onPlaylistLoad}
+          onProgress={onPlaylistProgress}
+          onEnd={onPlaylistEnd}
+          onBuffer={onVideoBuffer}
+          onError={onVideoError}
+          controls={false}
+          // composition 下没有「切段」事件，跨段连续性完全依赖 AVPlayer 的前向缓冲：
+          // RCTVideo.swift:968 → _playerItem.preferredForwardBufferDuration
+          // 0 = 系统自动（旧默认）；这里显式给 10s，让缓冲窗口能覆盖住下一段开头。
+          preferredForwardBufferDuration={10}
+          progressUpdateInterval={250}
+        />
+      )}
 
       {/* Loading overlay: black bg + spinner, covers all video slots */}
       {showOverlay && (

@@ -1217,3 +1217,103 @@ pcm_writei failed with 'cannot read/write stream data: I/O error' (-1)
 | 控制条点击 | 父级 `Pressable` 能收到 | 需额外透明点击层（原生视图会消费触摸） |
 
 **一句话**：JS 侧是一套代码、一个播放器、一条时间轴；两端的差别只有原生插件实现 + 上面这几条行为差异。
+
+---
+
+## 17. 风险与锁版本（插件是实验特性）
+
+官方文档 <https://docs.thewidlarzgroup.com/react-native-video/docs/v6/other/plugin> 明说：
+
+> **This is an experimental API and may change over time.**
+> The player handle should be treated as **read-only**. Modifying player behavior may cause unexpected issues
+> in `react-native-video`.
+
+同一页也明确列出了"扩展核心行为"的官方入口，**我们用的正是这两个**：
+
+| 平台 | 官方扩展点 | 我们用它做什么 |
+|---|---|---|
+| Android | `RNVExoplayerPlugin.overrideMediaSourceFactory`（文档原文："replacing the media source factory"） | 返回拼接后的 `ConcatenatingMediaSource2` |
+| iOS | `RNVAVPlayerPlugin.overridePlayerAsset` → `OverridePlayerAssetResult(type: .full, asset:)` | 返回 `AVMutableComposition` |
+
+> "These extension points are optional — if no plugin provides them, the player behaves exactly as it did before."
+> → 我们的守卫（无 `#playlist=` 返回 null）正好落在这句话上：不触发就等于插件不存在。
+
+**结论：不是 hack，但确实是"官方保留修改权"的接口。** 真实风险集中在**升级 react-native-video 时接口可能变**（方法签名、枚举名、调用时机）。
+
+### 已做的加固
+
+0. **升级前一条命令自检**：`yarn verify:rnv`（`scripts/check-rnv-contract.js`）
+   升级完 react-native-video 先跑它，会在**编译之前**告诉你：版本是否漂移、Android 的
+   `overrideMediaSourceFactory` / `registerPlugin` 还在不在、iOS 的 `overridePlayerAsset`
+   和 `OverridePlayerAssetType.full` 还在不在。任一项不存在就退出码 1。
+1. **锁版本**：`package.json` 里 `^6.19.2` → `6.19.2`（精确版本，避免 `yarn install` 静默升到 6.x 新版）。
+   lock 文件（`package-lock.json`）已入库；用哪个包管理器就把对应 lock 提交上去，**别两个混用**。
+2. **改动面收敛**：两端各 1 个插件文件 + 1 行注册（iOS `AppDelegate.mm` / Android `MainApplication.kt`），接口变了只改这两个文件。
+3. **自动降级**：插件只在 uri 带 `#playlist=` 且 ≥2 段时介入，其它 `<Video>` 完全不受影响；线上出问题时把 RN 传的 uri 换回裸 url，立刻退回单段播放，原生代码不用动。
+4. **回退路径完整**：旧的双播放器虚拟拼接方案 4 个 hook 全部保留未删（见第 10 节）。
+
+### 升级 react-native-video 前必做的冒烟
+
+升级后先跑一遍这 5 项，全过再发：
+
+1. 三段连播不中断（跨段无黑帧、无重新缓冲）
+2. 总时长正确（Android 第二段起应为三段之和；iOS 一开始就是）
+3. 拖到任意位置能正常播（含跨段拖动）
+4. 控制条点击 / 自动隐藏正常
+5. 普通视频（不带 `#playlist=`）不受影响
+
+### 如果哪天接口真改了
+
+按优先级选：
+
+1. 只改插件文件适配新签名（最可能，成本 1 小时内）
+2. JS 侧回退到双播放器虚拟拼接（hook 都还在）
+3. `patch-package` 直接改库（更脆，不推荐）
+4. fork 一份 react-native-video（成本最高）
+
+---
+
+## 18. 附：iOS `.full` 跳过 prepare 到底跳过了什么
+
+`RCTVideo.swift:542-550`：插件返回 `.full` 时直接 `return AVPlayerItem(asset:)`，
+**不再调用 `playerItemPrepareText`**（`:550` 才是默认路径）。被跳过的东西一共三类：
+
+```swift
+// RCTVideo.swift:703-727
+func playerItemPrepareText(...) async -> AVPlayerItem {
+    if source.textTracks.isEmpty == true || uri.hasSuffix(".m3u8") {
+        return await self.playerItemPropegateMetadata(AVPlayerItem(asset: asset))   // ① 没字幕：只补 metadata
+    }
+    self._allowsExternalPlayback = false              // ② composition 本来就不能 AirPlay
+    let mixComposition = await RCTVideoUtils.generateMixComposition(asset)
+    let validTextTracks = await RCTVideoUtils.getValidTextTracks(...)   // 外挂字幕注入
+    if validTextTracks.count != source.textTracks.count { setSelectedTextTrack(...) }
+    return await self.playerItemPropegateMetadata(AVPlayerItem(asset: mixComposition))
+}
+```
+
+| 被跳过的能力 | 依赖的 prop | 本项目是否用到 | 实际影响 |
+|---|---|---|---|
+| 外挂字幕注入 `textTracks` / `selectedTextTrack` / `onTextTracks` | `textTracks` | 没用 | **0** |
+| 自定义元数据 → `externalMetadata`（锁屏/控制中心/CarPlay 显示 title、artist、artwork 等） | `source.customMetadata` | 没传 | **0** |
+| 外挂字幕资源带 HTTP headers | `textTracks[].uri` + headers | 没用 | **0** |
+| tvOS 章节标记 `navigationMarkerGroups` | `chapters` | tvOS 不涉及 | **0** |
+| AirPlay（`_allowsExternalPlayback = false`） | — | composition 本来就不支持 AirPlay | **0**（跳过这行没区别） |
+
+**结论：当前用法（无字幕、无 customMetadata、无需鉴权的字幕）下，`.full` 的实际代价是 0。**
+
+### 什么时候不能再用 `.full`
+
+1. 要挂外挂字幕（`textTracks` prop）
+2. 要锁屏 / CarPlay 显示标题、封面
+3. 字幕资源需要带自定义 headers
+
+那时候的选择：
+- 在插件里自己把字幕轨混进 composition、自己写 `externalMetadata`（推荐，仍用 `.full`）
+- 或改回 `.partial` —— **但不建议**：`.partial` 会对 composition 再跑一次
+  `generateMixComposition`，源码注释写着 "AVPlayer can't airplay AVMutableCompositions"，行为不可预期
+
+### Android 没有这个概念
+
+Android 侧我们只替换了 `MediaSource.Factory`，`mediaItemBuilder`（streamKeys、DRM、clipping 等）
+仍由 `ReactExoplayerView` 走完（`ReactExoplayerView.java:1136-1152`），**没有跳过任何 prepare 步骤**。

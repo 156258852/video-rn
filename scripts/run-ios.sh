@@ -23,7 +23,9 @@ if [ -z "$UDID" ]; then
 fi
 echo "目标模拟器: $UDID"
 
-LOG=$(mktemp /tmp/rnbuild.XXXXXX.log)
+# 注意：mktemp 的模板必须以 XXXXXX 结尾，写成 /tmp/rnbuild.XXXXXX.log 在 macOS 上
+# 会报 "mkstemp failed on ...: File exists"，所以这里直接自己拼文件名。
+LOG="/tmp/rnbuild-$(date +%Y%m%d-%H%M%S).log"
 echo "编译中（日志: $LOG）..."
 if ! xcodebuild -workspace "$WORKSPACE" -scheme "$SCHEME" \
     -configuration Debug -sdk iphonesimulator -destination "id=$UDID" \
@@ -39,7 +41,9 @@ APP=$(find ios/build/DerivedData -name "$SCHEME.app" -type d | head -1)
 echo "安装: $APP"
 xcrun simctl install "$UDID" "$APP"
 
-BUNDLE_ID=$(defaults read "$APP/Info" CFBundleIdentifier)
+# 注意：defaults read 只认 domain 名，不认 plist 路径，会报
+# "Domain '.../Info' not found."，这里用 plutil 直接从 Info.plist 取值。
+BUNDLE_ID=$(plutil -extract CFBundleIdentifier raw -o - "$APP/Info.plist")
 echo "启动: $BUNDLE_ID"
 xcrun simctl launch "$UDID" "$BUNDLE_ID"
 

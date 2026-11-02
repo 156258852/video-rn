@@ -9,14 +9,6 @@ require Pod::Executable.execute_command('node', ['-p',
 # 不改会在 pod 的每个 target 上报 "range of supported deployment target versions is 15.0 to 27.0.x"
 platform :ios, '15.0'
 prepare_react_native_project!
-cd /Users/lhy/Desktop/code/FEDemo/video-rn/ios && \
-UDID=CB3B27D5-144E-44C0-B8D3-06E05BA432BE && \
-xcodebuild -workspace StitchRNPOCModern.xcworkspace -scheme StitchRNPOCModern \
-  -configuration Debug -sdk iphonesimulator -destination "id=$UDID" \
-  -derivedDataPath build/DerivedData build 2>&1 | grep -E "error:|BUILD " && \
-APP=$(find /Users/lhy/Desktop/code/FEDemo/video-rn/ios/build/DerivedData -name "StitchRNPOCModern.app" -type d | head -1) && \
-xcrun simctl install $UDID "$APP" && \
-xcrun simctl launch $UDID $(defaults read "$APP/Info" CFBundleIdentifier)
 
 linkage = ENV['USE_FRAMEWORKS']
 if linkage != nil
